@@ -56,6 +56,19 @@ def chat(config, messages: List[Dict], temperature: float = 0.2, max_tokens: int
         ) from e
 
     try:
-        return body["choices"][0]["message"]["content"] or ""
+        choice = body["choices"][0]
+        content = choice["message"]["content"] or ""
     except (KeyError, IndexError, TypeError) as e:
         raise LLMError(f"Unexpected response shape: {json.dumps(body)[:500]}") from e
+
+    # A response truncated at the token ceiling is NOT a complete reply — the
+    # closing ``` of an `act` block (or a whole plan) can be cut off, which the
+    # parser would silently read as "no action / done" and the harness would
+    # commit as finished work. That is the exact silent-work-loss class Achilles
+    # keeps hitting, so we surface it as an error instead of parsing a fragment.
+    if choice.get("finish_reason") == "length":
+        raise LLMError(
+            f"model output hit the {max_tokens}-token limit and was truncated; "
+            "raise max_tokens or split the step (a partial reply is unsafe to parse)."
+        )
+    return content
