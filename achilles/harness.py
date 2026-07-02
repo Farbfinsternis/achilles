@@ -44,7 +44,10 @@ Rules:
 - When the current step is fully implemented, STOP and reply with a short plain
   sentence (no `act` block). Do NOT claim success — the harness verifies itself.
 - Keep edits minimal and focused on the current step only.
-- The `write_file` body REPLACES the whole file, so include the complete file."""
+- The `write_file` body REPLACES the whole file, so include the complete file.
+- If the file you write itself contains ``` code fences (e.g. a Markdown README),
+  wrap the WHOLE act block in ~~~act … ~~~ instead of ``` so the inner fences are
+  not mistaken for the end of your block."""
 
 
 class Harness:
@@ -112,7 +115,9 @@ class Harness:
         tasks. (2) The FLOOR: a real oracle must be green. (3) The CEILING: the
         Definition of Done, judged and fix-looped until met. Absent a DoD, the
         floor (or a finished plan) is the whole story — the configured fallback."""
-        last_verify = self._work_through_plan(goal, plan)
+        ok, last_verify = self._work_through_plan(goal, plan)
+        if not ok:
+            return False
 
         if self.cfg.verify_command:
             ok, last_verify = self._ensure_floor_green(goal, plan)
@@ -126,17 +131,28 @@ class Harness:
             return True
         return self._acceptance_phase(goal, plan, criteria, last_verify)
 
-    def _work_through_plan(self, goal: str, plan: List[dict]) -> str | None:
+    def _work_through_plan(self, goal: str, plan: List[dict]):
         """Run every unfinished step once. The oracle runs after each step as a
         progress/regression SIGNAL (and feeds the next step's prompt), but it is
         NOT a gate — "read the tests" can never go green, and the plan's later
-        steps must still run."""
+        steps must still run.
+
+        Returns (ok, last_verify). ok is False when the model was unreachable:
+        the current step is left UNFINISHED (never marked done) so a resume
+        retries it — marking it done would burn the whole plan (every step done,
+        nothing to resume) even though no work happened."""
         last_verify = None
         for idx, step in enumerate(plan):
             if step["done"]:
                 continue
             self.log("\n" + ui.head(f"STEP {idx + 1}/{len(plan)}") + "\n" + ui.bold(step['text']))
-            self._work(self._work_prompt(step["text"], plan, last_verify))
+            if not self._work(self._work_prompt(step["text"], plan, last_verify)):
+                # Model error: this step did NOT run. Leave it open and stop, so
+                # a later resume picks up exactly here (Bug 1: silent plan burn).
+                self._save_plan(goal, plan)
+                self.log(ui.bad(f"\n✖  Halted at step {idx + 1}: the model was unreachable.") + "\n"
+                         + ui.muted("The step is left unfinished — fix the model server and re-run to resume."))
+                return False, last_verify
             passed, last_verify = self._verify()
             step["done"] = True
             self._save_plan(goal, plan)
@@ -146,7 +162,7 @@ class Harness:
             # oracle is a signal, not a gate) — this is just the visual receipt.
             mark = ui.ok("✔") if passed else ui.bad("✖")
             self.log(f"   {mark} " + ui.muted(f"step {idx + 1}/{len(plan)} done"))
-        return last_verify
+        return True, last_verify
 
     def _ensure_floor_green(self, goal: str, plan: List[dict]):
         """The oracle is the floor: nothing may be broken. Focused fix-loop if red."""
@@ -158,7 +174,9 @@ class Harness:
                      + " " + ui.muted("(oracle still red)"))
             instruction = ("The verification command still fails. Make the failing "
                            "checks pass. Read files as needed.")
-            self._work(self._work_prompt(instruction, plan, last_verify))
+            if not self._work(self._work_prompt(instruction, plan, last_verify)):
+                self.log(ui.bad("✖  Halted: the model was unreachable during the floor fix."))
+                return False, last_verify
             passed, last_verify = self._verify()
             self._commit(f"achilles: floor fix {attempt}")
             if passed:
@@ -186,7 +204,9 @@ class Harness:
                            "FILE (e.g. index.html) must be CREATED with the write_file tool; "
                            "only call generate_image if an actual IMAGE file is missing — do "
                            "not regenerate images to satisfy a missing HTML/CSS file:\n\n" + unmet)
-            self._work(self._work_prompt(instruction, plan, last_verify))
+            if not self._work(self._work_prompt(instruction, plan, last_verify)):
+                self.log(ui.bad("✖  Halted: the model was unreachable during an acceptance fix."))
+                return False
             self._commit(f"achilles: acceptance round {rnd}")
             if self.cfg.verify_command:                      # a fix must not break the floor
                 ok, last_verify = self._ensure_floor_green(goal, plan)
@@ -213,19 +233,26 @@ class Harness:
         self.log("   " + (ui.ok("✔ green") if passed else ui.bad("✖ red")))
         return passed, result
 
-    def _work(self, user_prompt: str) -> None:
+    def _work(self, user_prompt: str) -> bool:
         """One unit of work in a FRESH context (the 'reset'): system + pinned
         plan + instruction. Nothing from previous steps carries over, so the
-        window never fills up no matter how big the overall task is."""
+        window never fills up no matter how big the overall task is.
+
+        Returns False if the model was unreachable/errored, so the caller can
+        leave the step UNFINISHED instead of committing empty work as done."""
         system = EXECUTE_SYSTEM_TEMPLATE.format(tools=self.registry.describe())
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user_prompt},
         ]
-        self._act_until_done(messages)
+        return self._act_until_done(messages)
 
-    def _act_until_done(self, messages: List[dict]) -> None:
-        """Inner loop: let the model take actions until it stops acting."""
+    def _act_until_done(self, messages: List[dict]) -> bool:
+        """Inner loop: let the model take actions until it stops acting.
+
+        Returns True when the model finished acting normally (or hit the act
+        ceiling), False when a model error aborted the turn — the distinction the
+        caller needs so an outage can't be mistaken for a completed step."""
         acted = False
         nudged = False
         for _ in range(self.cfg.max_acts_per_step):
@@ -233,7 +260,7 @@ class Harness:
                 reply = chat(self.cfg, messages, temperature=self.cfg.temperature)
             except LLMError as e:
                 self.log(ui.bad(f"   ✖ model error: {e}"))
-                return
+                return False
             call = parse_tool_call(reply)
             if call is None:
                 # No `act` block. Normally that means the model considers the step
@@ -254,7 +281,7 @@ class Harness:
                         "block is discarded. If the step is genuinely complete, reply "
                         "again with a short plain sentence."})
                     continue
-                return
+                return True
             acted = True
             self.log("   " + ui.muted("act>") + " " + ui.accent(call.name) + " "
                      + call.args.get('path', call.args.get('command', '')))
@@ -262,6 +289,7 @@ class Harness:
             result = self.registry.dispatch(call, self.ctx)
             messages.append({"role": "user", "content": f"[tool result: {call.name}]\n{result}"})
         self.log(ui.muted("   (hit max acts for this step — verifying what we have)"))
+        return True
 
     def _work_prompt(self, instruction: str, plan: List[dict], last_verify: str | None) -> str:
         checklist = "\n".join(
@@ -390,7 +418,8 @@ class Harness:
             self.log(ui.muted("Initialising git repo for checkpoints…"))
             self._git("init")
             self._git("add", "-A")
-            self._git("commit", "-m", "achilles: initial checkpoint")
+            res = self._git("commit", "-m", "achilles: initial checkpoint")
+            self._warn_if_commit_failed(res, "initial checkpoint failed — commits may not work")
 
     def _commit(self, message: str) -> None:
         if not self.cfg.use_git:
@@ -399,3 +428,21 @@ class Harness:
         res = self._git("commit", "-m", message)
         if res.returncode == 0:
             self.log("   " + ui.paint("⎇", "green") + " " + ui.muted(f"committed: {message}"))
+            return
+        self._warn_if_commit_failed(res, "commit failed — no rollback checkpoint for this step")
+
+    @staticmethod
+    def _commit_had_nothing(res: subprocess.CompletedProcess) -> bool:
+        out = (res.stdout or "") + (res.stderr or "")
+        return "nothing to commit" in out or "no changes added" in out
+
+    def _warn_if_commit_failed(self, res: subprocess.CompletedProcess, what: str) -> None:
+        """A no-op commit (nothing changed) is normal and stays silent. Any other
+        failure means checkpointing — Achilles' core rollback promise — is broken,
+        so it must be surfaced, not swallowed (Bug 5). The usual real cause is an
+        unconfigured git identity (user.name/user.email) in a fresh repo."""
+        if res.returncode == 0 or self._commit_had_nothing(res):
+            return
+        out = ((res.stderr or "") + (res.stdout or "")).strip()
+        detail = out.splitlines()[-1] if out else f"git exited {res.returncode}"
+        self.log(ui.warn(f"   ⚠ git {what}: {detail}"))
