@@ -3,16 +3,18 @@
 # environment variable.
 
 # --- the engine (your local model) ---
-# LM Studio's OpenAI-compatible server (note the /v1 suffix).
-base_url = "http://192.168.0.8:1234/v1"
+# LM Studio's OpenAI-compatible server (note the /v1 suffix). Point this at your
+# own server/model — either here per project, or globally in ~/.achilles.toml.
+base_url = "http://localhost:1234/v1"
 api_key  = "no-key"            # LM Studio ignores this
-model    = "ornith-1.0-9b"     # the model's default identifier in LM Studio
+model    = "local-model"       # your model's identifier in LM Studio
 
-# --- ComfyUI image generation (optional) ---
-# With comfy_url set, the model gets a `generate_image` hand: Achilles unloads
-# the LM Studio model, renders via ComfyUI, then reloads the model. Register a
+# --- ComfyUI image generation (optional, OFF by default) ---
+# Set comfy_url to give the model a `generate_image` hand: Achilles unloads the
+# LM Studio model, renders via ComfyUI, then reloads the model. Leaving it empty
+# keeps the tool (and the planner/acceptance image nudges) disabled. Register a
 # workflow once (:workflow register <api-export.json>) and it becomes the default.
-comfy_url   = "http://127.0.0.1:8188"
+comfy_url   = ""               # e.g. "http://127.0.0.1:8188" to enable
 lms_command = "lms"            # LM Studio CLI used to swap the model in/out
 
 # --- the oracle: THE most important line ---
