@@ -1,0 +1,6 @@
+# Achilles has NO runtime dependencies — it uses only the Python 3.11+ stdlib
+# (urllib for HTTP, tomllib for config). That is on purpose: a minimal harness
+# should have nothing to install.
+#
+# To try the bundled example you only need pytest:
+#   pip install pytest

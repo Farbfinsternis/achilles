@@ -1,0 +1,63 @@
+# Achilles configuration. Copy this into any project you point Achilles at,
+# or edit in place. Every field can also be overridden with an ACHILLES_<FIELD>
+# environment variable.
+
+# --- the engine (your local model) ---
+# LM Studio's OpenAI-compatible server (note the /v1 suffix).
+base_url = "http://192.168.0.8:1234/v1"
+api_key  = "no-key"            # LM Studio ignores this
+model    = "ornith-1.0-9b"     # the model's default identifier in LM Studio
+
+# --- ComfyUI image generation (optional) ---
+# With comfy_url set, the model gets a `generate_image` hand: Achilles unloads
+# the LM Studio model, renders via ComfyUI, then reloads the model. Register a
+# workflow once (:workflow register <api-export.json>) and it becomes the default.
+comfy_url   = "http://127.0.0.1:8188"
+lms_command = "lms"            # LM Studio CLI used to swap the model in/out
+
+# --- the oracle: THE most important line ---
+# The command Achilles runs after every step to decide pass/fail. Without it,
+# Achilles is just guessing. This is what lets a weak model converge.
+#   Python:  "python -m pytest -q"
+#   Node:    "npm test --silent"
+#   Rust:    "cargo test --quiet"
+#   BreadCraft: whatever builds + checks your .crumb (your toolchain)
+verify_command = ""
+
+# --- the loop ---
+max_acts_per_step    = 12      # tool calls before we force a verify
+max_retries_per_step = 3       # red verifies tolerated before halting a step
+auto_approve_plan    = false   # set true to skip the plan confirmation prompt
+use_git              = true     # checkpoint each green step
+
+# --- the Definition of Done: the CEILING above the verify_command FLOOR ---
+# The planner emits a second artifact (.achilles/done.md): acceptance criteria
+# the result must meet, not just "nothing broke". cmd: criteria are checked by
+# running a command; judge: criteria by the model as a strict, context-isolated
+# reviewer of the files. An empty done.md falls back to oracle-green.
+use_acceptance       = true
+max_accept_rounds    = 3       # fix→re-judge rounds before halting on unmet criteria
+# Model for judge: criteria. Empty = reuse `model` (no second model loaded —
+# the fresh, adversarial, evidence-cited judge context handles circularity).
+judge_model          = ""
+
+temperature = 0.2
+
+# --- the tool registry (the model's hands, extensible) ---
+# The model always has the four built-in tools (read_file, write_file, list_dir,
+# run_command). You can add your OWN, two ways:
+#
+# 1) Manifest tools — a name + a command template, NO code. {arg} placeholders
+#    are filled from the act-block headers; {body} from the act body. Pass = the
+#    command's exit code. A new tool announces itself to the model automatically.
+#
+# [[tool]]
+# name = "html_valid"
+# description = "Check an HTML file parses with no errors. arg: path"
+# command = "python -m html5lib {path}"
+#
+# 2) Python plugins — point tools_dir at a folder of *.py files. Each file either
+#    defines `register(reg)` or a module-level `TOOLS = [Tool(...)]`. Your
+#    oracles/static_site.py becomes a tool this way.
+#
+# tools_dir = "tools"   # relative to the workspace, or an absolute path

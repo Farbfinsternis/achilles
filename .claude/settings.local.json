@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(achilles --help)",
+      "mcp__visualize__read_me",
+      "mcp__visualize__show_widget",
+      "Bash(cd \"G:/dev/projects/agent-tests/website\" && echo \"=== ROOT ===\" && ls -la && echo \"=== assets/ ===\" && ls -la assets/ 2>/dev/null | head -60 && echo \"=== any html anywhere ===\" && find . -iname '*.html' -not -path './.git/*' 2>/dev/null)",
+      "Bash(python -c \"import achilles.harness, achilles.repl, achilles.comfy, achilles.workflows, achilles.planner, achilles.acceptance; from achilles.config import load_config; from achilles.tools import build_registry; c=load_config\\('.'\\); r=build_registry\\(c, lambda *_: None\\); print\\('import OK; comfy on:', 'generate_image' in r.names\\(\\)\\)\")"
+    ]
+  }
+}
