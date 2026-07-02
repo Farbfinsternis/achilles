@@ -189,11 +189,17 @@ class Harness:
         """The ceiling: check the Definition of Done, fix the unmet criteria, repeat.
         This is where a small model is pushed past "nothing crashed" toward the
         actual goal — and where we keep the floor green after each fix."""
-        from .acceptance import check
+        from .acceptance import check, JudgeUnavailable
         for rnd in range(1, self.cfg.max_accept_rounds + 1):
             self.log("\n" + ui.head(f"ACCEPT {rnd}/{self.cfg.max_accept_rounds}", color="magenta")
                      + " " + ui.muted("(checking the Definition of Done)"))
-            failures = check(self.cfg, criteria, self.registry, self.ctx, self.log)
+            try:
+                failures = check(self.cfg, criteria, self.registry, self.ctx, self.log)
+            except JudgeUnavailable as e:
+                self.log(ui.bad(f"\n✖  Halted: the acceptance judge is unavailable ({e}).") + "\n"
+                         + ui.muted("This is an infrastructure failure, not unmet criteria — "
+                                    "start the judge model server and re-run to resume."))
+                return False
             if not failures:
                 self.log("\n" + ui.ok("✔  Definition of Done met — task complete."))
                 return True
@@ -213,7 +219,12 @@ class Harness:
                 if not ok:
                     return False
 
-        failures = check(self.cfg, criteria, self.registry, self.ctx, self.log)
+        try:
+            failures = check(self.cfg, criteria, self.registry, self.ctx, self.log)
+        except JudgeUnavailable as e:
+            self.log(ui.bad(f"\n✖  Halted: the acceptance judge is unavailable ({e}).") + "\n"
+                     + ui.muted("Infrastructure failure, not unmet criteria — re-run when it is back."))
+            return False
         if not failures:
             self.log("\n" + ui.ok("✔  Definition of Done met — task complete."))
             return True

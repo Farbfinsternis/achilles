@@ -59,6 +59,13 @@ class Failure:
     reason: str
 
 
+class JudgeUnavailable(RuntimeError):
+    """The judge MODEL could not be reached. This is an INFRASTRUCTURE failure,
+    not an unmet criterion: the accept loop must HALT, not treat every judged
+    criterion as failed and command the model to "fix" possibly-correct files
+    (Bug 11). Raised out of check(); the harness catches it and stops."""
+
+
 # ---- pass 2 of planning: derive the acceptance contract -------------------
 
 ACCEPT_SYSTEM = """You define the ACCEPTANCE CRITERIA for a coding goal — the checklist a STRICT
@@ -313,7 +320,9 @@ def _parse_verdicts(reply: str, n: int) -> list[tuple[bool, str]]:
 
 
 def _judge(config, items: list[Criterion], ctx, log) -> list[tuple[bool, str]]:
-    bundle = _gather_context(ctx)
+    bundle = _gather_context(ctx,
+                            per_file=getattr(config, "judge_char_per_file", 6000),
+                            total=getattr(config, "judge_char_budget", 24000))
     numbered = "\n".join(f"{i}. {c.text}" for i, c in enumerate(items, 1))
     messages = [
         {"role": "system", "content": JUDGE_SYSTEM},
@@ -325,8 +334,10 @@ def _judge(config, items: list[Criterion], ctx, log) -> list[tuple[bool, str]]:
         reply = chat(config, messages, temperature=0.0, max_tokens=1024,
                      model=config.judge_model or None)
     except LLMError as e:
+        # NOT a content FAIL — the judge server is down/unreachable. Signal the
+        # harness to halt instead of marking every criterion unmet (Bug 11).
         log(ui.bad(f"   ✖ judge unavailable: {e}"))
-        return [(False, f"judge unavailable: {e}")] * len(items)
+        raise JudgeUnavailable(str(e)) from e
     return _parse_verdicts(reply, len(items))
 
 
@@ -335,13 +346,19 @@ _TEXT_SUFFIXES = {".html", ".htm", ".css", ".js", ".ts", ".jsx", ".tsx", ".py",
                   ".json", ".md", ".txt", ".toml", ".yml", ".yaml", ".svg", ".cfg"}
 
 
-def _gather_context(ctx, per_file: int = 3000, total: int = 12000) -> str:
+def _gather_context(ctx, per_file: int = 6000, total: int = 24000) -> str:
     """Bundle the workspace's text files for the judge. v1 reads everything that
-    fits a small budget; large projects will want the repo-map retrieval that is
-    on the wishlist — the judge would then see only the relevant slice."""
+    fits the budget; large projects will want the repo-map retrieval that is on
+    the wishlist — the judge would then see only the relevant slice.
+
+    Files that don't fit are counted once at the end, not appended as per-file
+    marker lines (those used to grow unbounded, ironically eating the very budget
+    they reported). A trimmed/omitted file means the judge may lack evidence, so
+    the budget should be generous enough that this stays rare (Bug 7)."""
     root: Path = ctx.ws
     chunks: list[str] = []
     used = 0
+    omitted = 0
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
@@ -359,8 +376,13 @@ def _gather_context(ctx, per_file: int = 3000, total: int = 12000) -> str:
             snippet += f"\n... [{len(text) - per_file} chars trimmed] ..."
         block = f"=== {rel.as_posix()} ===\n{snippet}\n"
         if used + len(block) > total:
-            chunks.append(f"=== {rel.as_posix()} === (omitted — context budget reached)\n")
+            omitted += 1
             continue
         chunks.append(block)
         used += len(block)
-    return "\n".join(chunks) or "(no readable text files in the workspace)"
+    body = "\n".join(chunks) or "(no readable text files in the workspace)"
+    if omitted:
+        body += (f"\n[note: {omitted} more text file(s) omitted — context budget "
+                 "reached. A criterion whose evidence would live in an omitted or "
+                 "trimmed file cannot be judged from what is shown.]\n")
+    return body

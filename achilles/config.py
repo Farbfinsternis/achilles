@@ -42,6 +42,12 @@ class Config:
     # Model for judge: criteria. Empty → reuse `model` (no second model loaded;
     # the fresh, adversarial, evidence-cited judge context handles circularity).
     judge_model: str = ""
+    # How many characters of workspace text the judge sees. Too small and files
+    # get trimmed/omitted, so the judge can't cite evidence and wrongly FAILs
+    # correct work. Raise it toward your model's context window (~4 chars/token);
+    # lower it if the judge overflows. per_file caps any single file's slice.
+    judge_char_budget: int = 24000
+    judge_char_per_file: int = 6000
 
     # --- the tool registry (the model's hands, extensible) ---
     # Manifest tools come from achilles.toml `[[tool]]` blocks (name + command

@@ -5,12 +5,20 @@ Two documented bugs (contains-prose, exists+contains fusion) lived here, so
 these tests pin the repairs.
 """
 
+import pytest
+
+from achilles import acceptance
 from achilles.acceptance import (
     parse_acceptance,
     _normalise,
     _parse_verdicts,
     _sanitize_run,
+    _judge,
+    _gather_context,
+    Criterion,
+    JudgeUnavailable,
 )
+from achilles.llm import LLMError
 
 
 # ---- _normalise / parse_acceptance ---------------------------------------
@@ -99,3 +107,48 @@ def test_sanitize_strips_shell_tails():
 
 def test_sanitize_leaves_clean_command():
     assert _sanitize_run("python -m pytest -q") == "python -m pytest -q"
+
+
+# ---- judge infrastructure error (Bug 11) ----------------------------------
+
+class _Ctx:
+    def __init__(self, ws):
+        self.ws = ws
+
+
+class _JudgeCfg:
+    judge_model = ""
+    judge_char_budget = 24000
+    judge_char_per_file = 6000
+
+
+def test_judge_unavailable_raises_not_fail(monkeypatch, tmp_path):
+    (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
+
+    def boom(*a, **k):
+        raise LLMError("connection refused")
+
+    monkeypatch.setattr(acceptance, "chat", boom)
+    with pytest.raises(JudgeUnavailable):
+        _judge(_JudgeCfg(), [Criterion("judge", "looks good")],
+               _Ctx(tmp_path), lambda *a, **k: None)
+
+
+def test_judge_returns_verdicts_when_reachable(monkeypatch, tmp_path):
+    (tmp_path / "index.html").write_text("<canvas></canvas>", encoding="utf-8")
+    monkeypatch.setattr(acceptance, "chat",
+                        lambda *a, **k: "1: PASS - index.html has <canvas>")
+    out = _judge(_JudgeCfg(), [Criterion("judge", "has a canvas")],
+                 _Ctx(tmp_path), lambda *a, **k: None)
+    assert out == [(True, "index.html has <canvas>")]
+
+
+# ---- context budget (Bug 7) ------------------------------------------------
+
+def test_gather_context_summarises_omitted_files(tmp_path):
+    for i in range(5):
+        (tmp_path / f"f{i}.py").write_text("x" * 100, encoding="utf-8")
+    out = _gather_context(_Ctx(tmp_path), per_file=100, total=200)
+    # One summary note, not the old unbounded per-file marker lines.
+    assert "more text file(s) omitted" in out
+    assert "(omitted — context budget reached)" not in out
