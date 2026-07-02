@@ -74,3 +74,25 @@ def test_only_first_block_is_honoured():
     )
     call = parse_tool_call(text)
     assert call.args["path"] == "first.txt"
+
+
+def test_write_file_body_with_inner_backtick_fence_not_truncated():
+    # The reported bug: writing a README with a ```code``` block used to truncate
+    # the file at the first inner fence. The whole body must survive.
+    body = "# Title\n\n```python\nprint(1)\n```\n\nDone.\n"
+    text = f"```act\ntool: write_file\npath: README.md\n---\n{body}```"
+    call = parse_tool_call(text)
+    assert call is not None
+    assert call.name == "write_file"
+    assert "print(1)" in call.body
+    assert call.body.rstrip().endswith("Done.")
+
+
+def test_tilde_act_fence_lets_body_hold_backticks_verbatim():
+    body = "```js\nconst x = 1;\n```\n"
+    text = f"~~~act\ntool: write_file\npath: a.md\n---\n{body}~~~"
+    call = parse_tool_call(text)
+    assert call is not None
+    assert call.name == "write_file"
+    assert "const x = 1;" in call.body
+    assert "```js" in call.body

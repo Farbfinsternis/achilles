@@ -38,11 +38,19 @@ class ToolCall:
     body: Optional[str] = None
 
 
-# Match the FIRST fenced block tagged act/tool/action. We only ever honour one
-# action per model turn — one act, one result, loop. That keeps the loop simple
-# and stops a model from queuing five edits before seeing a single result.
+# Match a fenced block tagged act/tool/action. We only ever honour one action
+# per model turn — one act, one result, loop. That keeps the loop simple and
+# stops a model from queuing five edits before seeing a single result.
+#
+# The fence marker is captured and back-referenced for the close: a block opened
+# with ```  closes with ```, one opened with ~~~ closes with ~~~. The body match
+# is GREEDY on purpose so it runs to the LAST matching fence, not the first —
+# otherwise a write_file body that itself contains a ``` code fence (writing a
+# README, say) would be truncated at the first inner fence, silently losing the
+# rest of the file. A model can also sidestep the ambiguity entirely by wrapping
+# the block in ~~~act … ~~~, leaving ``` free to appear verbatim in the body.
 _FENCE_RE = re.compile(
-    r"```(?:act|tool|action)[^\n]*\n(.*?)```",
+    r"(?P<fence>```|~~~)(?:act|tool|action)[^\n]*\n(?P<body>.*)\n(?P=fence)",
     re.DOTALL | re.IGNORECASE,
 )
 _HEADER_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*:\s*(.*)$")
@@ -62,7 +70,7 @@ def parse_tool_call(text: str) -> Optional[ToolCall]:
     body_lines: list[str] = []
     in_body = False
 
-    for line in m.group(1).splitlines():
+    for line in m.group("body").splitlines():
         if in_body:
             body_lines.append(line)
             continue
