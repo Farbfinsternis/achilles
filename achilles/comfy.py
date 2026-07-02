@@ -102,10 +102,17 @@ def build_tool(config) -> Tool:
             if not image:
                 return "ERROR: ComfyUI finished but produced no image."
             target.write_bytes(client.image_bytes(image))
-            client.free()
         except (cc.ComfyError, lmstudio.LMStudioError) as e:
             return f"ERROR: image generation failed: {e}"
         finally:
+            # Hand ComfyUI's VRAM back BEFORE reloading the LM — and do it even if
+            # writing the image failed. Otherwise the reload can OOM on an 8GB card
+            # while ComfyUI still holds VRAM: exactly the failure the finally is
+            # supposed to prevent (Bug 4).
+            try:
+                client.free()
+            except cc.ComfyError as e:
+                ctx_log(f"   ⚠ could not free ComfyUI VRAM: {e}")
             # The one guarantee that matters: the brain always comes back.
             try:
                 lmstudio.load(config.model, config.lms_command, ctx_log)
