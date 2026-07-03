@@ -43,8 +43,9 @@ HELP = """Commands (everything else is treated as a goal for the model):
 
 WORKFLOW_HELP = """:workflow — register ComfyUI workflows so Achilles can make images.
   :workflow list                    show registered workflows (★ = default)
-  :workflow register <path> [name]  copy in a ComfyUI API-format export, detect
-                                    the prompt + resolution nodes, and save it
+  :workflow register <path> [name]  validate a marked ComfyUI API-format export
+                                    (title a node achilles:prompt / achilles:aspect)
+                                    and save it if the markers resolve
   :workflow default <name>          the workflow used when the model names none
   :workflow rm <name>               remove a workflow"""
 
@@ -256,20 +257,19 @@ class Repl:
         except wf.WorkflowError as e:
             print(ui.bad(f"   ✖ {e}"))
             return
+        # Echo what the markers resolved to (the human's mirror), then accept/reject.
+        for line in report.echo:
+            print("     " + ui.muted(line))
+        if not report.ok:
+            print(ui.bad(f"   ✖ not registered — {len(report.errors)} problem(s):"))
+            for err in report.errors:
+                print(ui.bad(f"       · {err}"))
+            return
         print(ui.ok(f"   ✔ registered '{name}'"))
-        print("     prompt node   : " + (ui.accent(str(report.prompt)) if report.prompt
-              else ui.warn("not found — the model's prompt won't be injected")))
-        if report.resolution:
-            r = report.resolution
-            print(f"     resolution    : {ui.accent(r.node + '.' + r.field)} "
-                  f"({r.kind})")
-            for a in wf.ASPECTS:
-                v = r.mapping.get(a)
-                mark = ui.accent(str(v)) if v else ui.warn("— unmapped")
-                print(f"        {a:9} → {mark}")
-        else:
-            print("     resolution    : " + ui.warn("no aspect control — runs at "
-                  "the workflow's built-in resolution"))
+        if report.unsupported_aspects:
+            print(ui.warn("     note: no mapping for "
+                          + ", ".join(report.unsupported_aspects)
+                          + " — those aspects are refused at render time."))
         if not store.get_default():
             store.set_default(name)
             print(ui.muted(f"     (set as default — first workflow)"))
