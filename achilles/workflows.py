@@ -181,31 +181,56 @@ def _pick_enum_field(inputs: dict, cls: str, object_info: Optional[dict]):
 
 
 def _combo_options(object_info: dict, cls: str, field_name: str) -> list:
-    """A combo input in /object_info is declared as `[[opt, opt, …], {meta}]`.
-    Return the option list, or [] if this field isn't a combo."""
+    """Return a combo input's option list, or [] if this field isn't a combo.
+    ComfyUI has TWO dialects for declaring a combo, and we accept both:
+      * old: `[[opt, opt, …], {meta}]`     — the options ARE the type (entry[0]).
+      * new: `["COMBO", {"options": […]}]` — the type is a name; options live in
+             the meta dict (newer ComfyUI). We don't hard-require the "COMBO"
+             string, just options-in-meta, to stay tolerant of type aliases."""
     spec = (object_info or {}).get(cls, {}).get("input", {})
     for group in ("required", "optional"):
         entry = spec.get(group, {}).get(field_name)
-        if entry and isinstance(entry[0], list):
+        if not entry:
+            continue
+        if isinstance(entry[0], list):
             return entry[0]
+        if len(entry) > 1 and isinstance(entry[1], dict) \
+                and isinstance(entry[1].get("options"), list):
+            return entry[1]["options"]
     return []
 
 
 def _map_enum(options: list, current) -> dict:
     """Map square/landscape/portrait onto the selector's real option strings by
-    substring hint. Unmatched aspects are left out (the REPL can fill them in)."""
+    substring hint. Unmatched aspects are left out (the REPL can fill them in).
+
+    Hints are tried in priority order (the numeric ratio FIRST, word hints after),
+    and each hint is scanned across ALL options before moving to the next. This
+    matters because a word hint can collide: the portrait label
+    "9:16 (Portrait Widescreen)" contains "widescreen" (a landscape hint), so an
+    option-outer/hint-inner scan would mis-map landscape onto it. Ratio-first,
+    option-inner lets the unambiguous "16:9" win before "widescreen" is tried."""
     mapping = {}
     for aspect, hints in _ASPECT_HINTS.items():
-        for opt in options:
-            if any(h in str(opt).lower() for h in hints):
-                mapping[aspect] = opt
+        for h in hints:
+            hit = next((o for o in options if h in str(o).lower()), None)
+            if hit is not None:
+                mapping[aspect] = hit
                 break
     # No option list (server was down at register time): keep the current value
-    # for whatever aspect it looks like, so at least the native shape still works.
+    # for the single aspect it best looks like, so at least the native shape still
+    # works. Ratio-first again, and assign to ONE aspect only (the strongest hit).
     if not options and isinstance(current, str):
+        cur = current.lower()
         for aspect, hints in _ASPECT_HINTS.items():
-            if any(h in current.lower() for h in hints):
+            if hints[0] in cur:            # the numeric ratio is the sure signal
                 mapping[aspect] = current
+                break
+        else:                             # no ratio token — fall back to any word
+            for aspect, hints in _ASPECT_HINTS.items():
+                if any(h in cur for h in hints):
+                    mapping[aspect] = current
+                    break
     return mapping
 
 
