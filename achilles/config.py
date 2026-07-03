@@ -8,7 +8,7 @@ without editing files: e.g. ACHILLES_MODEL=ornith-7b python -m achilles ...
 
 import os
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 
@@ -108,12 +108,42 @@ def load_config(workspace: str = ".") -> Config:
     if workspace_toml.resolve() != repo_root_toml.resolve():
         _apply_toml(cfg, workspace_toml)
 
-    # Environment overrides win over every file.
-    for field_name in (
-        "base_url", "api_key", "model", "verify_command", "workspace", "judge_model",
-    ):
-        env = os.environ.get("ACHILLES_" + field_name.upper())
-        if env is not None:
-            setattr(cfg, field_name, env)
+    # Environment overrides win over every file. The overridable set is derived
+    # from the dataclass fields themselves so it can NEVER drift from Config again
+    # — a hand-kept list once silently left comfy_url/lms_command un-overridable
+    # despite the documented "any field" promise. Only `tools` (list-valued) has
+    # no scalar env form and is skipped.
+    for f in fields(cfg):
+        if f.name == "tools":
+            continue
+        raw = os.environ.get("ACHILLES_" + f.name.upper())
+        if raw is None:
+            continue
+        try:
+            setattr(cfg, f.name, _coerce_env(getattr(cfg, f.name), raw))
+        except ValueError as e:
+            raise ValueError(f"ACHILLES_{f.name.upper()}={raw!r}: {e}") from e
 
     return cfg
+
+
+_ENV_TRUE = {"1", "true", "yes", "on"}
+_ENV_FALSE = {"0", "false", "no", "off"}
+
+
+def _coerce_env(current, raw: str):
+    """Coerce an env string to the field's existing type. bool is checked before
+    int (bool is a subclass of int) so ACHILLES_USE_GIT=false reads as False, not
+    a truthy int."""
+    if isinstance(current, bool):
+        v = raw.strip().lower()
+        if v in _ENV_TRUE:
+            return True
+        if v in _ENV_FALSE:
+            return False
+        raise ValueError("expected a boolean (true/false/1/0/yes/no/on/off)")
+    if isinstance(current, int):
+        return int(raw)
+    if isinstance(current, float):
+        return float(raw)
+    return raw
