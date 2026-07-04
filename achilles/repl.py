@@ -26,7 +26,7 @@ BANNER = (
     ui.paint("Achilles", "bold", "cyan")
     + " — interactive session. Type a goal in plain words, or "
     + ui.accent(":help") + " for commands.\n"
-    + ui.muted("(:quit or Ctrl-D to leave)")
+    + ui.muted("(end a line with \\ to continue on the next; :quit or Ctrl-D to leave)")
 )
 
 HELP = """Commands (everything else is treated as a goal for the model):
@@ -62,7 +62,7 @@ class Repl:
         self._show_config()
         while True:
             try:
-                line = input("\n" + ui.paint("achilles>", "bold", "cyan") + " ").strip()
+                line = self._read_line()
             except EOFError:
                 print()
                 break
@@ -81,6 +81,29 @@ class Repl:
                 print("\n(interrupted — progress is saved; re-type the same goal to resume)")
         print("bye.")
         return 0
+
+    def _read_line(self) -> str:
+        """Read one goal, allowing MULTI-LINE entry: a line ending with a backslash
+        continues on the next, and the break becomes a real newline in the goal. A
+        plain Enter still submits a single-line goal, exactly as before — so nothing
+        changes for the common case. Ctrl-D on the FIRST line quits; on a
+        continuation it submits whatever was typed so far."""
+        prompt = "\n" + ui.paint("achilles>", "bold", "cyan") + " "
+        cont = ui.paint("      ...>", "bold", "cyan") + " "
+        buf: list[str] = []
+        while True:
+            try:
+                chunk = input(prompt if not buf else cont)
+            except EOFError:
+                if buf:
+                    break            # don't lose a half-typed multi-line goal
+                raise
+            if chunk.endswith("\\"):
+                buf.append(chunk[:-1])
+                continue
+            buf.append(chunk)
+            break
+        return "\n".join(buf).strip()
 
     # ---- meta-commands ------------------------------------------------
 
