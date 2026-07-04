@@ -27,6 +27,13 @@ What we still READ (not guess) is *how* to drive a marked node: the aspect field
 real options come from `/object_info`, and we map the model's three words
 (square/landscape/portrait) onto them. Nothing here talks to LM Studio or renders;
 it only reads/writes JSON and asks a ComfyClient for `/object_info`.
+
+The one sanctioned exception to "the human marks it" is `register_adhoc`: for a
+throwaway workflow handed in at run time, a MODEL nominates the two node ids from a
+value-free digest of the graph, and we write the SAME markers it would have. Crucially
+this changes only WHERE the markers come from — the model's guess is then fed through
+the identical `validate_workflow`, so a wrong nomination is rejected with the same
+teaching error, never trusted blind. That is the whole safety of the ad-hoc path.
 """
 
 import json
@@ -35,6 +42,8 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+from . import llm
 
 
 # The three shapes the model can ask for. Each workflow maps them to its own
@@ -328,6 +337,7 @@ class RegisterReport:
     resolution: Optional[ResolutionSlot] = None
     echo: list = field(default_factory=list)        # human-readable resolutions
     errors: list = field(default_factory=list)      # teaching rejections
+    notes: list = field(default_factory=list)       # non-fatal warnings (ad-hoc)
     unsupported_aspects: list = field(default_factory=list)
 
     @property
@@ -441,19 +451,226 @@ def _resolve_aspect(graph: dict, marker: Marker, object_info: Optional[dict],
         rep.echo.append(f"     {a:<9} → {v if v is not None else '— not derivable'}")
 
 
+def _load_export(path: Path) -> dict:
+    """Read a ComfyUI API-format export and confirm its shape (a dict of nodes,
+    each carrying a class_type). Raises WorkflowError on anything else."""
+    graph = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(graph, dict) or not all(
+            isinstance(v, dict) and "class_type" in v for v in graph.values()):
+        raise WorkflowError(f"{path} is not a ComfyUI API-format export.")
+    return graph
+
+
 def register(store: Store, path: Path, name: str,
              object_info: Optional[dict] = None) -> RegisterReport:
     """Validate a marked workflow and, only if it is clean, persist it. Returns a
     RegisterReport (check `.ok`): on failure nothing is saved and `.errors` carry
     teaching messages. Raises only when the file itself isn't a ComfyUI export."""
-    graph = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(graph, dict) or not all(
-            isinstance(v, dict) and "class_type" in v for v in graph.values()):
-        raise WorkflowError(f"{path} is not a ComfyUI API-format export.")
-
+    graph = _load_export(Path(path))
     rep = validate_workflow(graph, object_info, name)
     if rep.ok:
         store.save(name, graph,
+                   Workflow(name=name, prompt=rep.prompt, resolution=rep.resolution))
+    return rep
+
+
+# ---- ad-hoc annotation: let a model place the markers a human didn't -------
+#
+# The curated path needs a human to title two nodes. The ad-hoc path asks the
+# MODEL to nominate those same two node ids from a value-free digest of the graph,
+# then writes synthetic `achilles:` markers so the SAME validate_workflow runs
+# afterwards. The model's whole job is two ids — no field resolution, no enum
+# mapping (validate_workflow still owns all of that) — so a bad nomination is
+# rejected by the validator exactly as a bad human marker would be.
+
+# class_type / title fragments that mark a workflow-internal prompt EXPANDER (a
+# second LLM the graph runs on the prompt). Used only to WARN about double
+# expansion when the marked prompt node feeds one of these before the encoder.
+_EXPANDER_HINTS = ("lmstudio", "ollama", "llm", "gpt", "qwen", "promptgen",
+                   "expand", "enhance")
+
+# Reasoning models (e.g. Ornith) emit a long <think>…</think> preamble before the
+# two answer lines — a full 41-node digest already cost ~4.6k completion tokens in
+# testing, and a bigger graph reasons longer. This is a CEILING, not a target: the
+# model stops at its own stop token, so a high value never forces long output, it
+# only stops a mid-thought truncation (which llm.chat rejects as unsafe to parse).
+# Keep it well under the server's context length (prompt + reasoning + answer must
+# all fit); raise it further for very large workflows.
+_ANNOTATE_MAX_TOKENS = 32768
+
+# Positive framing only. Telling a small local model what NOT to pick (the
+# negative prompt, a wired node) reliably draws it toward exactly that — the white-
+# elephant effect. In live testing the plain "find the node where the prompt is
+# entered" landed on the right node; a "beware the negative / not a wire" variant
+# drifted straight onto the negative-prompt node. So we describe the target, never
+# the traps.
+_ANNOTATE_SYSTEM = (
+    "Analyze this ComfyUI workflow from the end to the beginning. Find the node "
+    "where the prompt must be entered, and the node that configures the image "
+    "format.\n"
+    "Each line is one node: `id  class_type  \"title\"  input=<type|[->id]>`, where "
+    "[->id] is a wire from another node and <type> is a literal value.\n"
+    "Reply with exactly two lines:\n"
+    "prompt: <id>\naspect: <id>\n"
+    "If there is no image-format node, write `aspect: none`."
+)
+
+
+@dataclass
+class AnnotateReport:
+    graph: dict                                     # a COPY, markers written in
+    prompt_id: Optional[str] = None
+    aspect_id: Optional[str] = None
+    notes: list = field(default_factory=list)       # warnings (e.g. double expand)
+    errors: list = field(default_factory=list)      # hard failures (no usable id)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+def _node_order(graph: dict):
+    """Node ids in numeric order when they are all integers, else lexical."""
+    ids = list(graph)
+    if ids and all(i.isdigit() for i in ids):
+        return sorted(ids, key=int)
+    return sorted(ids)
+
+
+def _digest(graph: dict) -> str:
+    """A value-free, line-per-node abridgement for the nominating model: id,
+    class_type, title, and for each input ONLY whether it is a link ([->id]) or a
+    literal (<type>). Prompt texts, seeds and model paths are withheld on purpose —
+    noise for the "which node" question, and they blow up the context on big graphs."""
+    lines = []
+    for nid in _node_order(graph):
+        node = graph[nid]
+        cls = node.get("class_type", "")
+        title = ((node.get("_meta") or {}).get("title") or "").strip()
+        parts = []
+        for name, v in (node.get("inputs") or {}).items():
+            parts.append(f"{name}=[->{v[0]}]" if _is_link(v)
+                         else f"{name}=<{type(v).__name__}>")
+        head = f'{nid}  {cls}  "{title}"' if title else f"{nid}  {cls}"
+        lines.append(head + ("  " + " ".join(parts) if parts else ""))
+    return "\n".join(lines)
+
+
+def _strip_reasoning(text: str) -> str:
+    """Drop a reasoning model's <think>…</think> preamble so we parse only its
+    final answer. Closed blocks only — an unclosed one means the reply was
+    truncated mid-thought, which llm.chat already rejects upstream."""
+    return re.sub(r"<think>.*?</think>", "", text or "", flags=re.S | re.I)
+
+
+def _parse_nomination(text: str):
+    """Pull `prompt: <id>` and `aspect: <id>` from the model's reply. Returns
+    (prompt_id, aspect_id, ok). Tolerant of quotes and a `node ` prefix; 'none'/
+    '-'/'null' for aspect means "no aspect node". ok is False when the prompt line
+    is missing — we never fall back to guessing.
+
+    Takes the LAST match per role: a reasoning model may float candidates while
+    thinking ("could be node 3… no, 41"), and the final line is its verdict."""
+    text = _strip_reasoning(text)
+    def grab(role):
+        hits = re.findall(rf'{role}\s*[:=]\s*"?(?:node\s*)?([\w-]+)"?', text or "", re.I)
+        return hits[-1] if hits else None
+    p, a = grab("prompt"), grab("aspect")
+    if a and a.lower() in ("none", "null", "na", "-"):
+        a = None
+    return p, a, p is not None
+
+
+def _consumers(graph: dict) -> dict:
+    """node id -> list of node ids that wire in one of its outputs."""
+    cons: dict = {}
+    for nid, node in graph.items():
+        for v in (node.get("inputs") or {}).values():
+            if _is_link(v):
+                cons.setdefault(v[0], []).append(nid)
+    return cons
+
+
+def _expander_between(graph: dict, prompt_id: str) -> Optional[str]:
+    """Walking FORWARD from the marked prompt node toward its CLIPTextEncode sink,
+    is a prompt-expander node in the way? Returns that node's id (for the warning)
+    or None. Stops at encoders — expansion past the encoder is irrelevant."""
+    cons = _consumers(graph)
+    seen, stack = set(), list(cons.get(prompt_id, []))
+    while stack:
+        nid = stack.pop()
+        if nid in seen:
+            continue
+        seen.add(nid)
+        cls = _class(graph, nid).lower()
+        title = ((graph.get(nid, {}).get("_meta") or {}).get("title") or "").lower()
+        if "cliptextencode" in cls:
+            continue                       # reached the sink on this branch
+        if any(h in cls or h in title for h in _EXPANDER_HINTS):
+            return nid
+        stack.extend(cons.get(nid, []))
+    return None
+
+
+def annotate(graph: dict, config, chat=llm.chat) -> AnnotateReport:
+    """Ask a model to nominate the prompt and aspect node ids, then write them as
+    synthetic `achilles:` title markers into a COPY of the graph. Injects nothing
+    else — validate_workflow still resolves fields, options and errors. `chat` is
+    injectable so tests need no server."""
+    import copy
+    try:
+        reply = chat(
+            config,
+            [{"role": "system", "content": _ANNOTATE_SYSTEM},
+             {"role": "user", "content": _digest(graph)}],
+            temperature=0.0, max_tokens=_ANNOTATE_MAX_TOKENS)
+    except llm.LLMError as e:
+        return AnnotateReport(graph, errors=[f"could not analyse workflow: {e}"])
+
+    p, a, ok = _parse_nomination(reply)
+    if not ok:
+        return AnnotateReport(
+            graph, errors=["the model did not name a prompt node "
+                           f"(reply: {(reply or '').strip()[:200]!r})."])
+
+    out = copy.deepcopy(graph)
+    rep = AnnotateReport(out, prompt_id=p, aspect_id=a)
+    if p not in out:
+        rep.errors.append(f"model named prompt node '{p}', not in the workflow.")
+        return rep
+    if a is not None and a not in out:
+        rep.notes.append(f"model named aspect node '{a}', not in the workflow — "
+                         "ignored (rendering at the built-in resolution).")
+        a = rep.aspect_id = None
+
+    out[p].setdefault("_meta", {})["title"] = _MARKER_PREFIX + "prompt"
+    if a is not None:
+        out[a].setdefault("_meta", {})["title"] = _MARKER_PREFIX + "aspect"
+
+    exp = _expander_between(out, p)
+    if exp:
+        rep.notes.append(
+            f"node {exp} ('{_class(out, exp)}') sits between the prompt node {p} and "
+            "the encoder — your prompt gets re-expanded inside the workflow. If that "
+            "is not intended, mark the node closer to the encoder instead.")
+    return rep
+
+
+def register_adhoc(store: Store, path: Path, name: str, config,
+                   object_info: Optional[dict] = None,
+                   chat=llm.chat) -> RegisterReport:
+    """Like register(), but a MODEL places the markers instead of a human. Loads
+    the export, annotates a copy, then runs the exact same validate_workflow — so a
+    mis-nomination is rejected with the same teaching errors, never trusted blind.
+    Persists only when clean. Annotation warnings ride along in `.notes`."""
+    graph = _load_export(Path(path))
+    ann = annotate(graph, config, chat=chat)
+    if not ann.ok:
+        return RegisterReport(name=name, errors=list(ann.errors), notes=list(ann.notes))
+    rep = validate_workflow(ann.graph, object_info, name)
+    rep.notes[0:0] = ann.notes
+    if rep.ok:
+        store.save(name, ann.graph,
                    Workflow(name=name, prompt=rep.prompt, resolution=rep.resolution))
     return rep
 

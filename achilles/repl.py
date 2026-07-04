@@ -46,6 +46,9 @@ WORKFLOW_HELP = """:workflow — register ComfyUI workflows so Achilles can make
   :workflow register <path> [name]  validate a marked ComfyUI API-format export
                                     (title a node achilles:prompt / achilles:aspect)
                                     and save it if the markers resolve
+  :workflow try <path> [name]       let the model find the prompt/aspect nodes
+                                    itself (no marking needed); saves as _adhoc
+                                    (or [name]) and makes it the default
   :workflow default <name>          the workflow used when the model names none
   :workflow rm <name>               remove a workflow"""
 
@@ -217,6 +220,8 @@ class Repl:
             self._workflow_list(store)
         elif sub in ("register", "add"):
             self._workflow_register(store, rest)
+        elif sub in ("try", "adhoc"):
+            self._workflow_try(store, rest)
         elif sub in ("default", "std"):
             self._workflow_default(store, rest)
         elif sub in ("rm", "remove", "del"):
@@ -273,6 +278,44 @@ class Repl:
         if not store.get_default():
             store.set_default(name)
             print(ui.muted(f"     (set as default — first workflow)"))
+
+    def _workflow_try(self, store: wf.Store, rest: str) -> None:
+        """Ad-hoc import: the model nominates the prompt/aspect nodes, we validate
+        that nomination and save under _adhoc (or a given name) as the default."""
+        if not rest:
+            print(ui.bad("   ✖ usage: :workflow try <path> [name]"))
+            return
+        path_str, name = _split_path_and_name(rest)
+        path = Path(path_str).expanduser()
+        if not path.is_file():
+            print(ui.bad(f"   ✖ no such file: {path}"))
+            return
+        name = name or "_adhoc"
+        print(ui.muted("   … asking the model to find the prompt & aspect nodes"))
+        try:
+            report = wf.register_adhoc(store, path, name, self.cfg, self._object_info())
+        except wf.WorkflowError as e:
+            print(ui.bad(f"   ✖ {e}"))
+            return
+        # Warnings first (double expansion etc.), then the resolved-slot mirror.
+        for note in report.notes:
+            print(ui.warn(f"   ⚠ {note}"))
+        for line in report.echo:
+            print("     " + ui.muted(line))
+        if not report.ok:
+            print(ui.bad(f"   ✖ not registered — {len(report.errors)} problem(s):"))
+            for err in report.errors:
+                print(ui.bad(f"       · {err}"))
+            print(ui.muted("     (the model's guess did not resolve — mark the nodes "
+                           "by hand and use :workflow register)"))
+            return
+        print(ui.ok(f"   ✔ imported '{name}'"))
+        if report.unsupported_aspects:
+            print(ui.warn("     note: no mapping for "
+                          + ", ".join(report.unsupported_aspects)
+                          + " — those aspects are refused at render time."))
+        store.set_default(name)
+        print(ui.muted(f"     (set as default)"))
 
     def _workflow_default(self, store: wf.Store, name: str) -> None:
         try:

@@ -239,3 +239,129 @@ def test_apply_injects_prompt_and_aspect(tmp_path):
     graph = wf.apply(store, "krea", "a warm bakery", "landscape")
     assert graph["4"]["inputs"]["text"] == "a warm bakery"
     assert graph["22"]["inputs"]["aspect_ratio"] == "16:9 (Widescreen)"
+
+
+# ---- ad-hoc annotation ----------------------------------------------------
+#
+# A faithful mini-Standard.json: the raw prompt in 41 flows through the LMStudio
+# expander 40, a PreviewAny pass-through 39, and only THEN into the CLIPTextEncode
+# 3 (whose `text` is WIRED, not a literal). This is the exact shape where Ornith
+# once claimed a direct 40->3 link; the validator must reject a nomination of 3.
+STD_GRAPH = {
+    "3":  {"class_type": "CLIPTextEncode",
+           "inputs": {"text": ["39", 0], "clip": ["4", 1]},
+           "_meta": {"title": "CLIP Text Encode (Prompt)"}},
+    "4":  {"class_type": "Power Lora Loader (rgthree)",
+           "inputs": {"model": ["1", 0], "clip": ["2", 0]},
+           "_meta": {"title": "Power Lora Loader"}},
+    "39": {"class_type": "PreviewAny", "inputs": {"source": ["40", 0]},
+           "_meta": {"title": "Preview as Text"}},
+    "40": {"class_type": "> LMStudio",
+           "inputs": {"prompt": ["41", 0], "system_message": "expand it"},
+           "_meta": {"title": "LMStudio"}},
+    "41": {"class_type": "PrimitiveStringMultiline",
+           "inputs": {"value": "a woman in a batman costume"},
+           "_meta": {"title": "Text String (Multiline)"}},
+    "21": {"class_type": "CM_SDXLResolution", "inputs": {"resolution": "768x1344"},
+           "_meta": {"title": "SDXLResolution"}},
+    "24": {"class_type": "EmptyLatentImage",
+           "inputs": {"width": ["21", 0], "height": ["21", 1], "batch_size": 1},
+           "_meta": {"title": "Empty Latent Image"}},
+}
+
+
+def _std_oi():
+    oi = {n["class_type"]: {"input": {"required": {}}} for n in STD_GRAPH.values()}
+    oi["CM_SDXLResolution"]["input"]["required"]["resolution"] = _combo(WXH_OPTIONS)
+    return oi
+
+
+def _chat(reply):
+    """A stub llm.chat that always returns `reply` (no server, no config needed)."""
+    def f(config, messages, temperature=0.0, max_tokens=200):
+        return reply
+    return f
+
+
+def test_digest_withholds_values_but_keeps_wiring():
+    d = wf._digest(STD_GRAPH)
+    assert "41  PrimitiveStringMultiline" in d
+    assert "value=<str>" in d                       # the field, as a type…
+    assert "batman" not in d                         # …never the literal text
+    assert "768x1344" not in d                       # nor the resolution value
+    assert "text=[->39]" in d                        # links ARE shown (the chain)
+
+
+def test_parse_nomination_variants():
+    assert wf._parse_nomination("prompt: 41\naspect: 21") == ("41", "21", True)
+    assert wf._parse_nomination("prompt: node 41\naspect: none") == ("41", None, True)
+    assert wf._parse_nomination("no idea") == (None, None, False)
+
+
+def test_parse_nomination_strips_reasoning_and_takes_verdict():
+    # A reasoning model floats a wrong candidate while thinking, then commits in the
+    # final lines. The <think> block is stripped and the LAST match wins.
+    reply = ("<think>the title says Prompt on node 3, maybe prompt: 3? no, its text "
+             "is wired, follow it back to 41</think>\nprompt: 41\naspect: 21")
+    assert wf._parse_nomination(reply) == ("41", "21", True)
+
+
+def test_annotate_marks_nominated_nodes_and_copies():
+    rep = wf.annotate(STD_GRAPH, None, chat=_chat("prompt: 41\naspect: 21"))
+    assert rep.ok
+    assert rep.graph["41"]["_meta"]["title"] == "achilles:prompt"
+    assert rep.graph["21"]["_meta"]["title"] == "achilles:aspect"
+    # the input graph is untouched (annotate works on a copy)
+    assert STD_GRAPH["41"]["_meta"]["title"] == "Text String (Multiline)"
+
+
+def test_annotate_warns_about_double_expansion():
+    rep = wf.annotate(STD_GRAPH, None, chat=_chat("prompt: 41\naspect: 21"))
+    assert any("re-expanded" in n and "40" in n for n in rep.notes)
+
+
+def test_annotate_rejects_id_not_in_graph():
+    rep = wf.annotate(STD_GRAPH, None, chat=_chat("prompt: 999\naspect: none"))
+    assert not rep.ok
+    assert any("not in the workflow" in e for e in rep.errors)
+
+
+def _write(tmp_path, graph):
+    src = tmp_path / "src"
+    src.mkdir(exist_ok=True)
+    p = src / "wf.json"
+    p.write_text(json.dumps(graph), encoding="utf-8")
+    return p
+
+
+def test_register_adhoc_end_to_end(tmp_path):
+    store = wf.Store(tmp_path / "store")
+    path = _write(tmp_path, STD_GRAPH)
+    rep = wf.register_adhoc(store, path, "_adhoc", None, _std_oi(),
+                            chat=_chat("prompt: 41\naspect: 21"))
+    assert rep.ok, rep.errors
+    assert "_adhoc" in store.names()
+    graph = wf.apply(store, "_adhoc", "hello world", "portrait")
+    assert graph["41"]["inputs"]["value"] == "hello world"     # raw prompt node
+    assert graph["21"]["inputs"]["resolution"] == "896x1152"   # portrait WxH
+
+
+def test_register_adhoc_rejects_wired_encoder(tmp_path):
+    """The 40->3 regression: nominating the CLIPTextEncode (whose text is wired)
+    must be rejected by the SAME validator, not silently accepted."""
+    store = wf.Store(tmp_path / "store")
+    path = _write(tmp_path, STD_GRAPH)
+    rep = wf.register_adhoc(store, path, "_adhoc", None, _std_oi(),
+                            chat=_chat("prompt: 3\naspect: 21"))
+    assert not rep.ok
+    assert any("no literal text field" in e for e in rep.errors)
+    assert "_adhoc" not in store.names()                       # nothing persisted
+
+
+def test_register_adhoc_rejects_unparseable_reply(tmp_path):
+    store = wf.Store(tmp_path / "store")
+    path = _write(tmp_path, STD_GRAPH)
+    rep = wf.register_adhoc(store, path, "_adhoc", None, _std_oi(),
+                            chat=_chat("I think it lives somewhere in the graph"))
+    assert not rep.ok
+    assert any("did not name a prompt node" in e for e in rep.errors)
