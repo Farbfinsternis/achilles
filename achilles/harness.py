@@ -157,8 +157,8 @@ class Harness:
             # approval covers both the steps and the acceptance contract.
             if self.cfg.use_acceptance:
                 self._make_and_save_dod(goal, tree)
-            if not self._approve():
-                self.log("Stopped. Edit .achilles/plan.md (and done.md) and re-run to continue.")
+            plan = self._approve_loop(goal, plan)
+            if plan is None:
                 return False
 
         # STATE: EXECUTE.
@@ -589,18 +589,61 @@ class Harness:
             return []
         return parse_acceptance(self.dod_path.read_text(encoding="utf-8"))
 
-    def _approve(self) -> bool:
+    def _approve(self) -> str:
+        """The user's verdict on the plan: 'yes', 'no', or 'edit'. Auto-approve and
+        non-interactive runs proceed."""
         if self.cfg.auto_approve_plan:
-            return True
+            return "yes"
         import sys
         if not sys.stdin.isatty():
-            return True  # non-interactive run: proceed
+            return "yes"  # non-interactive run: proceed
         ans = input("\nProceed with this plan? [Y/n/edit] ").strip().lower()
         if ans in ("", "y", "yes"):
-            return True
+            return "yes"
         if ans in ("e", "edit"):
-            self.log(f"Edit {self.plan_path} then re-run.")
-        return False
+            return "edit"
+        return "no"
+
+    def _approve_loop(self, goal: str, plan: List[dict]):
+        """Approve the plan, allowing in-place edits that KEEP the untouched steps.
+
+        'edit' used to be a dead-end: it told you to edit plan.md and re-run, but a
+        re-run only resumed if you retyped the goal byte-for-byte — otherwise the
+        plan was archived and rebuilt from scratch, losing every step. Instead we
+        pause HERE, let you edit the saved plan.md, RELOAD it, and re-ask — so only
+        what you changed changes. Returns the plan to execute, or None if declined."""
+        while True:
+            decision = self._approve()
+            if decision == "yes":
+                return plan
+            if decision == "no":
+                self.log("Stopped. Re-run the same goal to resume from the saved plan.")
+                return None
+            # edit: the user tweaks .achilles/plan.md (and optionally done.md), then
+            # we reload from disk. done.md needs no reload here — _execute reads it
+            # fresh — so an edit there is honoured automatically.
+            self._prompt_plan_edit()
+            edited = self._load_plan()
+            if not edited:
+                self.log(ui.bad("✖  The plan is empty or unparseable after editing — "
+                                "leaving it untouched and stopping."))
+                return None
+            plan = edited
+            self.log("")
+            self._print_plan(plan)
+
+    def _prompt_plan_edit(self) -> None:
+        """Pause so the user can edit the saved plan in their own editor, then press
+        Enter; we reload afterwards. Deliberately editor-agnostic — launching $EDITOR
+        races GUI editors that return before the file is saved, whereas 'edit, then
+        press Enter' works everywhere."""
+        self.log(ui.muted(f"\n   Edit the plan in {self.plan_path}"
+                          " (and .achilles/done.md if you like)."))
+        self.log(ui.muted("   Keep the lines you want; one `- [ ] step` per line."))
+        try:
+            input(ui.muted("   Press Enter when you've saved your edits… "))
+        except (EOFError, KeyboardInterrupt):
+            self.log("")
 
     # ---- git checkpointing --------------------------------------------
 
