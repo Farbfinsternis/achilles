@@ -18,6 +18,7 @@ from .config import Config
 from .harness import Harness
 from . import style as ui
 from . import comfy_client as cc
+from . import lmstudio
 from . import workflows as wf
 from .comfy import _store_dir
 
@@ -59,6 +60,12 @@ class Repl:
 
     def run(self) -> int:
         print(BANNER)
+        # Resolve the model BEFORE showing the config: ensure_loaded adopts the real
+        # loaded model-key over the "local-model" placeholder (and warms a cold LM
+        # Studio), so the config table shows the model that will actually be used.
+        lmstudio.ensure_loaded(
+            self.cfg,
+            lambda m: print(ui.warn(m) if "⚠" in m else ui.muted(m)))
         self._show_config()
         while True:
             try:
