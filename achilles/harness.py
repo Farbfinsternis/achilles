@@ -21,7 +21,7 @@ from typing import Callable, List
 
 from .config import Config
 from .llm import chat, complete_act, ActReply, LLMError
-from .planner import make_plan
+from .planner import make_plan, revise_plan
 from .protocol import parse_tool_call, ToolCall
 from .tools import build_registry, ToolContext
 from . import style as ui
@@ -157,7 +157,7 @@ class Harness:
             # approval covers both the steps and the acceptance contract.
             if self.cfg.use_acceptance:
                 self._make_and_save_dod(goal, tree)
-            plan = self._approve_loop(goal, plan)
+            plan = self._approve_loop(goal, plan, tree)
             if plan is None:
                 return False
 
@@ -604,14 +604,14 @@ class Harness:
             return "edit"
         return "no"
 
-    def _approve_loop(self, goal: str, plan: List[dict]):
-        """Approve the plan, allowing in-place edits that KEEP the untouched steps.
+    def _approve_loop(self, goal: str, plan: List[dict], tree: str):
+        """Approve the plan, allowing MODEL-driven edits that keep the untouched steps.
 
-        'edit' used to be a dead-end: it told you to edit plan.md and re-run, but a
-        re-run only resumed if you retyped the goal byte-for-byte — otherwise the
-        plan was archived and rebuilt from scratch, losing every step. Instead we
-        pause HERE, let you edit the saved plan.md, RELOAD it, and re-ask — so only
-        what you changed changes. Returns the plan to execute, or None if declined."""
+        'edit' asks you to describe the change in plain words; the model then revises
+        the plan — keeping the steps your change doesn't touch — and we re-print and
+        re-ask. This replaces the old dead-end ("edit the file and re-run"), which
+        rebuilt the whole plan from scratch unless you retyped the goal exactly.
+        Returns the plan to execute, or None if declined."""
         while True:
             decision = self._approve()
             if decision == "yes":
@@ -619,31 +619,32 @@ class Harness:
             if decision == "no":
                 self.log("Stopped. Re-run the same goal to resume from the saved plan.")
                 return None
-            # edit: the user tweaks .achilles/plan.md (and optionally done.md), then
-            # we reload from disk. done.md needs no reload here — _execute reads it
-            # fresh — so an edit there is honoured automatically.
-            self._prompt_plan_edit()
-            edited = self._load_plan()
-            if not edited:
-                self.log(ui.bad("✖  The plan is empty or unparseable after editing — "
-                                "leaving it untouched and stopping."))
-                return None
-            plan = edited
+            # edit: the model revises the plan from a plain-words instruction.
+            instruction = self._ask_edit_instruction()
+            if not instruction:
+                continue                       # empty → nothing to change, re-ask
+            try:
+                steps = revise_plan(self.cfg, goal, [s["text"] for s in plan],
+                                    instruction, tree)
+            except LLMError as e:
+                self.log(ui.bad(f"✖  Could not revise the plan: {e}"))
+                continue                       # keep the current plan, re-ask
+            if not steps:
+                self.log(ui.warn("⚠  The model returned no revised steps — keeping the "
+                                 "current plan."))
+                continue
+            plan = [{"done": False, "text": s} for s in steps]
+            self._save_plan(goal, plan)
             self.log("")
             self._print_plan(plan)
 
-    def _prompt_plan_edit(self) -> None:
-        """Pause so the user can edit the saved plan in their own editor, then press
-        Enter; we reload afterwards. Deliberately editor-agnostic — launching $EDITOR
-        races GUI editors that return before the file is saved, whereas 'edit, then
-        press Enter' works everywhere."""
-        self.log(ui.muted(f"\n   Edit the plan in {self.plan_path}"
-                          " (and .achilles/done.md if you like)."))
-        self.log(ui.muted("   Keep the lines you want; one `- [ ] step` per line."))
+    def _ask_edit_instruction(self) -> str:
+        """Ask the user, in plain words, what to change about the plan."""
         try:
-            input(ui.muted("   Press Enter when you've saved your edits… "))
+            return input("\nDescribe the change for the model to make "
+                         "(plain words, empty to cancel): ").strip()
         except (EOFError, KeyboardInterrupt):
-            self.log("")
+            return ""
 
     # ---- git checkpointing --------------------------------------------
 

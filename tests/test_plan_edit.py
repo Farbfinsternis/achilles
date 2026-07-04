@@ -1,11 +1,15 @@
 """
-Plan approval with in-place editing. 'edit' must let the user change part of the
-plan and KEEP the rest — the old behaviour dead-ended to "edit the file and re-run",
-and a re-run rebuilt the whole plan unless the goal was retyped byte-for-byte.
+Plan approval with MODEL-driven editing. 'edit' asks the user to describe a change
+in plain words; the model then revises the plan, keeping the steps the change
+doesn't touch. (The old behaviour dead-ended to "edit the file and re-run", which
+rebuilt the whole plan unless the goal was retyped byte-for-byte.)
 """
 import types
 
+import pytest
+
 from achilles import harness as H
+from achilles.llm import LLMError
 
 
 def _cfg(tmp_path):
@@ -21,65 +25,75 @@ def _mk(tmp_path):
     return h
 
 
-def test_edit_keeps_untouched_steps(tmp_path, monkeypatch):
+def test_edit_revises_via_model_and_keeps_untouched(tmp_path, monkeypatch):
     h = _mk(tmp_path)
     plan = [{"done": False, "text": "step one"},
             {"done": False, "text": "step two"}]
-    h._save_plan("build it", plan)
 
-    decisions = iter(["edit", "yes"])
-    monkeypatch.setattr(h, "_approve", lambda: next(decisions))
+    _decisions = iter(["edit", "yes"])
+    monkeypatch.setattr(h, "_approve", lambda: next(_decisions))
+    monkeypatch.setattr(h, "_ask_edit_instruction", lambda: "make step two about CSS")
 
-    # The edit revises step two on disk but leaves step one alone.
-    def _edit():
-        h._save_plan("build it", [{"done": False, "text": "step one"},
-                                  {"done": False, "text": "step two REVISED"}])
-    monkeypatch.setattr(h, "_prompt_plan_edit", _edit)
+    def _revise(config, goal, steps, instruction, tree):
+        assert steps == ["step one", "step two"]         # current plan handed over
+        assert instruction == "make step two about CSS"
+        return ["step one", "step two about CSS"]         # model keeps step one
+    monkeypatch.setattr(H, "revise_plan", _revise)
 
-    result = h._approve_loop("build it", plan)
-    assert [s["text"] for s in result] == ["step one", "step two REVISED"]
+    result = h._approve_loop("build", plan, "tree")
+    assert [s["text"] for s in result] == ["step one", "step two about CSS"]
+    # and it was persisted to plan.md
+    assert [s["text"] for s in h._load_plan()] == ["step one", "step two about CSS"]
 
 
 def test_no_returns_none(tmp_path, monkeypatch):
     h = _mk(tmp_path)
     monkeypatch.setattr(h, "_approve", lambda: "no")
-    assert h._approve_loop("g", [{"done": False, "text": "x"}]) is None
+    assert h._approve_loop("g", [{"done": False, "text": "x"}], "t") is None
 
 
 def test_yes_returns_same_plan(tmp_path, monkeypatch):
     h = _mk(tmp_path)
     plan = [{"done": False, "text": "x"}]
     monkeypatch.setattr(h, "_approve", lambda: "yes")
-    assert h._approve_loop("g", plan) is plan
+    assert h._approve_loop("g", plan, "t") is plan
 
 
-def test_edit_to_empty_plan_aborts(tmp_path, monkeypatch):
+def test_empty_instruction_cancels_edit(tmp_path, monkeypatch):
+    # Cancelling the edit (empty instruction) must NOT call the model or touch plan.
     h = _mk(tmp_path)
     plan = [{"done": False, "text": "x"}]
-    h._save_plan("g", plan)
-    monkeypatch.setattr(h, "_approve", lambda: "edit")
+    _decisions = iter(["edit", "yes"])
+    monkeypatch.setattr(h, "_approve", lambda: next(_decisions))
+    monkeypatch.setattr(h, "_ask_edit_instruction", lambda: "")
 
-    def _wipe():   # user deletes every step line
-        h.plan_path.write_text("# Achilles plan\n\n> Goal: g\n\n", encoding="utf-8")
-    monkeypatch.setattr(h, "_prompt_plan_edit", _wipe)
+    def _boom(*a, **k):
+        raise AssertionError("revise_plan must not be called on an empty instruction")
+    monkeypatch.setattr(H, "revise_plan", _boom)
 
-    assert h._approve_loop("g", plan) is None
+    assert h._approve_loop("g", plan, "t") is plan       # unchanged, then approved
 
 
-def test_repeated_edits_accumulate(tmp_path, monkeypatch):
-    # edit → edit → yes: each edit reloads from disk, so successive tweaks stick.
+def test_revise_error_keeps_current_plan(tmp_path, monkeypatch):
     h = _mk(tmp_path)
-    plan = [{"done": False, "text": "a"}]
-    h._save_plan("g", plan)
-    decisions = iter(["edit", "edit", "yes"])
-    monkeypatch.setattr(h, "_approve", lambda: next(decisions))
+    plan = [{"done": False, "text": "x"}]
+    _decisions = iter(["edit", "yes"])
+    monkeypatch.setattr(h, "_approve", lambda: next(_decisions))
+    monkeypatch.setattr(h, "_ask_edit_instruction", lambda: "do a thing")
 
-    edits = iter([
-        [{"done": False, "text": "a"}, {"done": False, "text": "b"}],
-        [{"done": False, "text": "a"}, {"done": False, "text": "b"},
-         {"done": False, "text": "c"}],
-    ])
-    monkeypatch.setattr(h, "_prompt_plan_edit", lambda: h._save_plan("g", next(edits)))
+    def _boom(*a, **k):
+        raise LLMError("model unreachable")
+    monkeypatch.setattr(H, "revise_plan", _boom)
 
-    result = h._approve_loop("g", plan)
-    assert [s["text"] for s in result] == ["a", "b", "c"]
+    assert h._approve_loop("g", plan, "t") is plan       # error → keep, re-ask, approve
+
+
+def test_revise_empty_result_keeps_current_plan(tmp_path, monkeypatch):
+    h = _mk(tmp_path)
+    plan = [{"done": False, "text": "x"}]
+    _decisions = iter(["edit", "yes"])
+    monkeypatch.setattr(h, "_approve", lambda: next(_decisions))
+    monkeypatch.setattr(h, "_ask_edit_instruction", lambda: "do a thing")
+    monkeypatch.setattr(H, "revise_plan", lambda *a, **k: [])
+
+    assert h._approve_loop("g", plan, "t") is plan

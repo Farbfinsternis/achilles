@@ -93,3 +93,54 @@ def make_plan(config, goal: str, tree: str) -> List[str]:
     # config.max_tokens (0 = use the model's own context window).
     reply = chat(config, messages, temperature=config.temperature)
     return parse_checklist(reply)
+
+
+# Used when the user picks "edit" at plan approval: they describe a change in plain
+# words and the MODEL revises the plan — keeping the steps the change doesn't touch,
+# rather than the user hand-rewriting the checklist. The same rigid output contract
+# as make_plan, so the reply parses identically.
+REVISE_SYSTEM = """You are revising an existing plan for a coding agent that works in SMALL, verifiable steps.
+
+Apply the user's requested change to the plan. CRITICAL:
+- KEEP every existing step the change does not touch, in its original order and wording.
+- Change ONLY what the request asks: edit, add, remove or reorder the affected steps.
+- Do not re-plan from scratch and do not "improve" untouched steps.
+- The LAST step stays the one that runs the tests / build to confirm everything works.
+
+OUTPUT FORMAT — strict. Output ONLY the full revised checklist, nothing else:
+- [ ] first step
+- [ ] second step
+No preamble, no numbering, no explanation. Every line starts with "- [ ] "."""
+
+
+REVISE_USER_TEMPLATE = """Project files (top level):
+{tree}
+
+Goal:
+{goal}
+
+Current plan:
+{plan}
+
+Requested change:
+{instruction}
+
+Write the COMPLETE revised checklist now (keep the untouched steps verbatim)."""
+
+
+def revise_plan(config, goal: str, steps: List[str], instruction: str,
+                tree: str) -> List[str]:
+    """Re-plan in place: hand the model the current steps plus the user's change and
+    return the revised checklist. Preserves untouched steps by contract (see
+    REVISE_SYSTEM), so "edit" adjusts a plan instead of discarding it."""
+    system = REVISE_SYSTEM
+    if getattr(config, "comfy_url", ""):
+        system += IMAGE_PLAN_NUDGE
+    current = "\n".join(f"- [ ] {s}" for s in steps)
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": REVISE_USER_TEMPLATE.format(
+            tree=tree, goal=goal, plan=current, instruction=instruction)},
+    ]
+    reply = chat(config, messages, temperature=config.temperature)
+    return parse_checklist(reply)
