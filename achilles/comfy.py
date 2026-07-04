@@ -94,8 +94,13 @@ def build_tool(config) -> Tool:
         # Learn the REAL loaded model-key before we unload it, so the reload below
         # restores exactly what the user had — not config.model, which is often a
         # placeholder ("local-model") that `lms load` can't resolve. Falls back to
-        # config.model if detection turns up nothing.
-        reload_target = lmstudio.loaded_llm(config.lms_command) or config.model
+        # config.model if detection turns up nothing. Also refresh the remembered
+        # key so a later cold start restores this exact model, even if the user
+        # switched models in LM Studio since the session began.
+        detected = lmstudio.loaded_llm(config.lms_command)
+        if detected:
+            lmstudio.remember_model(detected)
+        reload_target = detected or config.model
 
         try:
             lmstudio.unload_all(config.lms_command, ctx_log)

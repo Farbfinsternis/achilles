@@ -27,7 +27,8 @@
       "Bash(echo \"---EXIT $?---\")",
       "Bash(lms load *)",
       "Bash(lms ls *)",
-      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); [print\\(m.get\\('modelKey'\\) or m.get\\('path'\\) or m\\) for m in \\(d if isinstance\\(d,list\\) else d.get\\('models',[]\\)\\)]\")"
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); [print\\(m.get\\('modelKey'\\) or m.get\\('path'\\) or m\\) for m in \\(d if isinstance\\(d,list\\) else d.get\\('models',[]\\)\\)]\")",
+      "Bash(PYTHONIOENCODING=utf-8 python -m pytest tests/ -q)"
     ]
   }
 }

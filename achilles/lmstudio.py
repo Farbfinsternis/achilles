@@ -17,11 +17,30 @@ verbs and an availability check to fail *before* we ever unload.
 import json
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Callable, Optional
 
 
 class LMStudioError(RuntimeError):
     pass
+
+
+# Where we remember the last model in use, so a cold LM Studio (nothing loaded)
+# can be restored to the model the user actually ran. Machine-global on purpose:
+# "the model you had loaded" is a fact about LM Studio, not about one workspace.
+_STATE_DIR = Path.home() / ".achilles"
+_LAST_MODEL_FILE = _STATE_DIR / "last_model"
+
+# The shipped config placeholder. LM Studio's API serves whatever is loaded, so
+# users never have to set `model` to a real key — but that means it is NOT a
+# loadable target either. Treated as "no real model" everywhere below.
+_PLACEHOLDER_MODELS = {"", "local-model"}
+
+
+def _real_key(model: str) -> Optional[str]:
+    """The model-key if it looks like a real one to `lms load`, else None."""
+    m = (model or "").strip()
+    return m if m and m not in _PLACEHOLDER_MODELS else None
 
 
 def available(lms_command: str = "lms") -> bool:
@@ -72,6 +91,58 @@ def loaded_llm(lms_command: str = "lms") -> Optional[str]:
             if key:
                 return key
     return None
+
+
+def remember_model(model_key: str) -> None:
+    """Record the model-key currently in use, so a later cold start (LM Studio
+    launched with nothing loaded) can restore it. Placeholders are never saved —
+    they can't be reloaded. Best-effort: a write failure must not break a run."""
+    if not _real_key(model_key):
+        return
+    try:
+        _STATE_DIR.mkdir(parents=True, exist_ok=True)
+        _LAST_MODEL_FILE.write_text(model_key.strip() + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def last_remembered() -> Optional[str]:
+    """The last model-key remember_model() saved, or None."""
+    try:
+        key = _LAST_MODEL_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return key or None
+
+
+def ensure_loaded(config, log: Callable[[str], None] = print) -> None:
+    """Guarantee a chat model is resident before Achilles ever calls it.
+
+    LM Studio can sit with NOTHING loaded — a fresh launch, or after our own image
+    swap died mid-render. Every LLM call then 400s with "No models loaded" and the
+    run dies before it starts. So at startup: if a model is loaded, just remember
+    it; if not, load the last one we saw (the model the user actually used), and
+    only fall back to config.model when that is a real key.
+
+    Best-effort and silent on the happy path — it never raises, so a genuinely
+    unresolvable state still reaches llm.py's clear error instead of a traceback."""
+    if not available(config.lms_command):
+        return  # no `lms` CLI: we can't manage models; llm.py reports the rest
+    current = loaded_llm(config.lms_command)
+    if current:
+        remember_model(current)
+        return
+    target = last_remembered() or _real_key(getattr(config, "model", ""))
+    if not target:
+        log("   ⚠ no model loaded in LM Studio and none remembered — load one "
+            "(`lms load`) or set a real `model` in achilles.toml.")
+        return
+    log(f"   no model loaded — loading last used {target}…")
+    try:
+        _run(config.lms_command, "load", target, "-y")
+        remember_model(target)
+    except LMStudioError as e:
+        log(f"   ⚠ could not load {target}: {e}")
 
 
 def unload_all(lms_command: str = "lms", log: Callable[[str], None] = print) -> None:

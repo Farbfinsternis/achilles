@@ -26,6 +26,7 @@ from .tools import build_registry, ToolContext
 from . import style as ui
 from . import workflows as wf
 from . import comfy_client as cc
+from . import lmstudio
 from .comfy import _store_dir
 
 
@@ -69,6 +70,13 @@ class Harness:
     def run(self, goal: str) -> bool:
         self.state_dir.mkdir(exist_ok=True)
         self._maybe_git_init()
+
+        # A cold LM Studio (nothing loaded) makes the very first LLM call — the
+        # planner — 400 with "No models loaded", killing the run before it starts.
+        # Restore the last model the user actually used, so the run just works.
+        lmstudio.ensure_loaded(
+            self.cfg,
+            lambda m: self.log(ui.warn(m) if "⚠" in m else ui.muted(m)))
 
         # A user can just write "use this workflow …" and drag the file into the
         # terminal (which inserts its path). Adopt it as the run's image workflow
