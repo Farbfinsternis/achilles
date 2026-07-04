@@ -132,7 +132,21 @@ def build_tool(config) -> Tool:
 
         return f"OK: wrote {path} ({aspect}, via workflow '{name}')."
 
-    return Tool("generate_image", _DESCRIPTION, run, usage=_USAGE)
+    parameters = {
+        "type": "object",
+        "properties": {
+            "prompt": {"type": "string",
+                       "description": "English, descriptive prompt for the image"},
+            "path": {"type": "string",
+                     "description": "where to save it, e.g. assets/hero.jpg"},
+            "aspect": {"type": "string", "enum": ["square", "landscape", "portrait"],
+                       "description": "optional, default landscape"},
+            "workflow": {"type": "string",
+                         "description": "only if the user named one, else omit"},
+        },
+        "required": ["prompt", "path"],
+    }
+    return Tool("generate_image", _DESCRIPTION, run, usage=_USAGE, parameters=parameters)
 
 
 def _store_dir(config) -> Path:

@@ -78,6 +78,14 @@ class Config:
     # limit. Set a positive value only to deliberately throttle output length.
     max_tokens: int = 0
 
+    # Offer NATIVE (OpenAI) tool-calling: send the tools as a JSON schema and read
+    # back structured tool_calls. Tool-tuned models (even small 4B ones) drive the
+    # act-loop far better this way than with the text `act` protocol they were
+    # never trained on. On by default, with an automatic fallback: if the server
+    # rejects the tools field, or the model answers in prose, Achilles parses the
+    # text `act` block instead — so nothing breaks on a server/model without it.
+    native_tools: bool = True
+
     @property
     def workspace_path(self) -> Path:
         return Path(self.workspace).resolve()

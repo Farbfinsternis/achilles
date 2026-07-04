@@ -14,12 +14,13 @@ The whole philosophy of Achilles lives in one sentence:
 None of this requires a clever model. It requires a clever *loop*.
 """
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Callable, List
 
 from .config import Config
-from .llm import chat, LLMError
+from .llm import chat, complete_act, ActReply, LLMError
 from .planner import make_plan
 from .protocol import parse_tool_call, ToolCall
 from .tools import build_registry, ToolContext
@@ -54,6 +55,26 @@ Rules:
   not mistaken for the end of your block."""
 
 
+# The native-tool-calling variant: the tools arrive as real functions (the OpenAI
+# `tools` field), so the model calls them directly and we drop the fence syntax.
+# The behavioural rules are the same — only the "how to act" part differs.
+NATIVE_SYSTEM_TEMPLATE = """You are Achilles, a coding agent working in ONE small step of a larger plan.
+
+You have these tools, provided to you as callable functions — call them directly:
+
+{tools}
+
+Rules:
+- Take ONE action per message, then wait for its result before the next.
+- Read before you write. Don't guess a file's contents — read_file it first.
+- To CREATE or CHANGE a file you MUST call the write_file tool. Code shown in a
+  normal message is NOT saved — only write_file persists a file.
+- write_file's `content` REPLACES the whole file, so pass the complete file.
+- When the current step is fully implemented, STOP: reply with a short plain
+  sentence and NO tool call. Do NOT claim success — the harness verifies itself.
+- Keep changes minimal and focused on the current step only."""
+
+
 class Harness:
     def __init__(self, config: Config, log: Callable[[str], None] = print):
         self.cfg = config
@@ -61,6 +82,11 @@ class Harness:
         self.ws = config.workspace_path
         self.ctx = ToolContext(self.ws)
         self.registry = build_registry(config, log)
+        # Native tool-calling is on unless config says otherwise; the schema is
+        # built once. _native_tools may flip to False mid-run if the server turns
+        # out not to accept the tools field (see _act_until_done).
+        self._native_tools = getattr(config, "native_tools", True)
+        self._tool_schema = self.registry.tool_schemas()
         self.state_dir = self.ws / ".achilles"
         self.plan_path = self.state_dir / "plan.md"
         self.dod_path = self.state_dir / "done.md"
@@ -320,56 +346,119 @@ class Harness:
 
         Returns False if the model was unreachable/errored, so the caller can
         leave the step UNFINISHED instead of committing empty work as done."""
-        system = EXECUTE_SYSTEM_TEMPLATE.format(tools=self.registry.describe())
         messages = [
-            {"role": "system", "content": system},
+            {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": user_prompt},
         ]
         return self._act_until_done(messages)
 
+    def _system_prompt(self) -> str:
+        """The act-loop system prompt, matched to the current protocol: native
+        tool-calling drops the fence syntax and the usage examples (the JSON schema
+        carries the arg shape), the text protocol keeps both."""
+        tools = self.registry.describe(include_usage=not self._native_tools)
+        template = NATIVE_SYSTEM_TEMPLATE if self._native_tools else EXECUTE_SYSTEM_TEMPLATE
+        return template.format(tools=tools)
+
     def _act_until_done(self, messages: List[dict]) -> bool:
         """Inner loop: let the model take actions until it stops acting.
 
-        Returns True when the model finished acting normally (or hit the act
-        ceiling), False when a model error aborted the turn — the distinction the
-        caller needs so an outage can't be mistaken for a completed step."""
+        Native tool-calling first (structured tool_calls), with the text `act`
+        protocol as the fallback — for a model that answers in prose, and for a
+        whole run if the server rejects the tools field. Returns True when the
+        model finished acting (or hit the act ceiling), False when a model error
+        aborted the turn — so an outage is never mistaken for a completed step."""
         acted = False
         nudged = False
         for _ in range(self.cfg.max_acts_per_step):
-            try:
-                reply = chat(self.cfg, messages, temperature=self.cfg.temperature)
-            except LLMError as e:
-                self.log(ui.bad(f"   ✖ model error: {e}"))
-                return False
-            call = parse_tool_call(reply)
+            if self._native_tools:
+                try:
+                    reply = complete_act(self.cfg, messages, self._tool_schema,
+                                         temperature=self.cfg.temperature)
+                except LLMError as e:
+                    # The server may not accept the tools field. Drop native for the
+                    # rest of this run and retry the SAME turn on the text protocol;
+                    # if the error was something else (e.g. no model loaded) the
+                    # retry surfaces it cleanly.
+                    self._native_tools = False
+                    self.log(ui.muted("   (native tool-calling unavailable — "
+                                      "falling back to the text protocol)"))
+                    messages[0]["content"] = self._system_prompt()
+                    continue
+            else:
+                try:
+                    text = chat(self.cfg, messages, temperature=self.cfg.temperature)
+                except LLMError as e:
+                    self.log(ui.bad(f"   ✖ model error: {e}"))
+                    return False
+                reply = ActReply(content=text, tool_calls=[])
+
+            # Native path: run every tool_call the model emitted, threading a
+            # tool-role result back for each (the shape the native protocol wants).
+            if reply.tool_calls:
+                acted = True
+                messages.append(self._assistant_tool_msg(reply))
+                for tc in reply.tool_calls:
+                    call = self.registry.build_call(tc["name"], tc["arguments"])
+                    self._log_act(call)
+                    result = self.registry.dispatch(call, self.ctx)
+                    messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                     "content": result})
+                continue
+
+            # Text path (fallback, and the only path in text mode): parse an `act`
+            # block out of the prose reply.
+            reply_text = reply.content
+            call = parse_tool_call(reply_text)
             if call is None:
-                # No `act` block. Normally that means the model considers the step
-                # done. But a weak model often DUMPS a file's content as a plain
-                # ```code``` block instead of a write_file act — which the harness
-                # never saves, silently losing the whole step's work. Nudge once
-                # toward the protocol when the reply looks like a lost write: it
-                # carries a code fence (the tell-tale dump), or the step did
-                # NOTHING at all. If it really is done, it just repeats and we accept.
-                if not nudged and ("```" in (reply or "") or not acted):
+                # No action. Normally that means the model considers the step done.
+                # But a weak model often DUMPS a file's content as a plain ```code```
+                # block instead of writing it — silently losing the step's work.
+                # Nudge once when the reply looks like a lost write (a code fence, the
+                # tell-tale dump) or the step did NOTHING. If it really is done, it
+                # just repeats and we accept.
+                if not nudged and ("```" in (reply_text or "") or not acted):
                     nudged = True
-                    self.log(ui.muted("   (no action taken — reminding the model to use write_file)"))
-                    messages.append({"role": "assistant", "content": reply})
-                    messages.append({"role": "user", "content":
-                        "You produced no `act` block, so NOTHING was saved. If you "
-                        "meant to create or change a file, you MUST use the write_file "
-                        "tool inside an ```act``` block — content shown in a plain code "
-                        "block is discarded. If the step is genuinely complete, reply "
-                        "again with a short plain sentence."})
+                    self.log(ui.muted("   (no action taken — reminding the model to use its tools)"))
+                    messages.append({"role": "assistant", "content": reply_text})
+                    messages.append({"role": "user", "content": self._nudge_text()})
                     continue
                 return True
             acted = True
-            self.log("   " + ui.muted("act>") + " " + ui.accent(call.name) + " "
-                     + call.args.get('path', call.args.get('command', '')))
-            messages.append({"role": "assistant", "content": reply})
+            self._log_act(call)
+            messages.append({"role": "assistant", "content": reply_text})
             result = self.registry.dispatch(call, self.ctx)
             messages.append({"role": "user", "content": f"[tool result: {call.name}]\n{result}"})
         self.log(ui.muted("   (hit max acts for this step — verifying what we have)"))
         return True
+
+    def _log_act(self, call: ToolCall) -> None:
+        self.log("   " + ui.muted("act>") + " " + ui.accent(call.name) + " "
+                 + (call.args.get("path", call.args.get("command", "")) or ""))
+
+    @staticmethod
+    def _assistant_tool_msg(reply: ActReply) -> dict:
+        """Rebuild the assistant message with its tool_calls in OpenAI shape, so the
+        tool-role results that follow are accepted by the server."""
+        return {
+            "role": "assistant",
+            "content": reply.content or None,
+            "tool_calls": [
+                {"id": tc["id"], "type": "function",
+                 "function": {"name": tc["name"],
+                              "arguments": json.dumps(tc["arguments"])}}
+                for tc in reply.tool_calls],
+        }
+
+    def _nudge_text(self) -> str:
+        if self._native_tools:
+            return ("You called no tool, so NOTHING was saved. If you meant to create "
+                    "or change a file, call the write_file tool. If the step is "
+                    "genuinely complete, reply with a short plain sentence.")
+        return ("You produced no `act` block, so NOTHING was saved. If you meant to "
+                "create or change a file, you MUST use the write_file tool inside an "
+                "```act``` block — content shown in a plain code block is discarded. "
+                "If the step is genuinely complete, reply again with a short plain sentence.")
 
     def _work_prompt(self, instruction: str, plan: List[dict], last_verify: str | None) -> str:
         checklist = "\n".join(

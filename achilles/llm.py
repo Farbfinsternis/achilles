@@ -20,7 +20,8 @@ import sys
 import threading
 import urllib.error
 import urllib.request
-from typing import List, Dict
+from dataclasses import dataclass
+from typing import List, Dict, Optional
 
 
 class LLMError(RuntimeError):
@@ -86,7 +87,6 @@ def chat(config, messages: List[Dict], temperature: float = 0.2,
     instead of Achilles guessing a ceiling that truncates whole-file writes."""
     if max_tokens is None:
         max_tokens = getattr(config, "max_tokens", 0) or 0
-    url = config.base_url.rstrip("/") + "/chat/completions"
     payload = {
         "model": model or config.model,
         "messages": messages,
@@ -97,20 +97,55 @@ def chat(config, messages: List[Dict], temperature: float = 0.2,
     # llama.cpp generate up to the loaded model's context limit.
     if max_tokens and max_tokens > 0:
         payload["max_tokens"] = max_tokens
-    data = json.dumps(payload).encode("utf-8")
+    body = _send(config, payload)
+
+    try:
+        choice = body["choices"][0]
+        content = choice["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError) as e:
+        raise LLMError(f"Unexpected response shape: {json.dumps(body)[:500]}") from e
+
+    # A response truncated at the token ceiling is NOT a complete reply — the
+    # closing ``` of an `act` block (or a whole plan) can be cut off, which the
+    # parser would silently read as "no action / done" and the harness would
+    # commit as finished work. That is the exact silent-work-loss class Achilles
+    # keeps hitting, so we surface it as an error instead of parsing a fragment.
+    if choice.get("finish_reason") == "length":
+        raise _length_error(max_tokens)
+    return content
+
+
+def _length_error(max_tokens: int) -> "LLMError":
+    """The shared 'truncated at the token ceiling' error — a partial reply (text
+    OR a tool_call with cut-off arguments) is unsafe to parse."""
+    if max_tokens and max_tokens > 0:
+        return LLMError(
+            f"model output hit the {max_tokens}-token max_tokens cap and was "
+            "truncated; raise max_tokens (or set it to 0 to use the model's "
+            "full context) or split the step (a partial reply is unsafe to parse).")
+    return LLMError(
+        "model output filled the model's context window and was truncated; "
+        "load the model with a larger context in LM Studio or split the step "
+        "(a partial reply is unsafe to parse).")
+
+
+def _send(config, payload: Dict) -> Dict:
+    """POST one completion request and return the parsed JSON body.
+
+    Runs the blocking call in a worker thread and manages the clock here, so a
+    slow-but-healthy generation is never killed: every request_timeout seconds of
+    silence we ask the human whether to keep waiting; "yes" just joins again — the
+    same generation is still running on the untouched connection."""
+    url = config.base_url.rstrip("/") + "/chat/completions"
     req = urllib.request.Request(
         url,
-        data=data,
+        data=json.dumps(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {config.api_key}",
         },
         method="POST",
     )
-    # Run the blocking call in a worker and manage the clock here, so a slow-but-
-    # healthy generation is never killed. Every request_timeout seconds of silence
-    # we ask the human whether to keep waiting; "yes" just joins again — the same
-    # generation is still running on the untouched connection.
     result: Dict = {}
     worker = threading.Thread(target=_request_worker, args=(req, result), daemon=True)
     worker.start()
@@ -131,31 +166,65 @@ def chat(config, messages: List[Dict], temperature: float = 0.2,
     if err is not None:
         raise _llm_error_for(err, url, config) from err
     try:
-        body = json.loads(result["body"])
+        return json.loads(result["body"])
     except (ValueError, KeyError) as e:
         raise LLMError(f"Could not decode the response from {url}: {e}") from e
 
+
+@dataclass
+class ActReply:
+    """One native-tool-calling turn: the assistant's text (a preamble, or the
+    'I'm done' sentence) plus any tool_calls it emitted. tool_calls entries are
+    {'id', 'name', 'arguments': dict} — already JSON-decoded."""
+    content: str
+    tool_calls: List[Dict]
+    finish_reason: Optional[str] = None
+
+
+def complete_act(config, messages: List[Dict], tools: List[Dict],
+                 temperature: float = 0.2, max_tokens: int | None = None,
+                 model: str | None = None) -> "ActReply":
+    """Like chat(), but offers NATIVE tool-calling: send the `tools` schema and
+    return the assistant's tool_calls (if any) alongside its text. A tool-tuned
+    model answers with structured tool_calls here where it would fumble the text
+    `act` protocol. If it returns plain text instead, tool_calls is empty and the
+    caller falls back to parsing the text — so both formats coexist."""
+    if max_tokens is None:
+        max_tokens = getattr(config, "max_tokens", 0) or 0
+    payload = {
+        "model": model or config.model,
+        "messages": messages,
+        "temperature": temperature,
+        "stream": False,
+        "tools": tools,
+    }
+    if max_tokens and max_tokens > 0:
+        payload["max_tokens"] = max_tokens
+    body = _send(config, payload)
+
     try:
         choice = body["choices"][0]
-        content = choice["message"]["content"] or ""
+        msg = choice["message"]
     except (KeyError, IndexError, TypeError) as e:
         raise LLMError(f"Unexpected response shape: {json.dumps(body)[:500]}") from e
 
-    # A response truncated at the token ceiling is NOT a complete reply — the
-    # closing ``` of an `act` block (or a whole plan) can be cut off, which the
-    # parser would silently read as "no action / done" and the harness would
-    # commit as finished work. That is the exact silent-work-loss class Achilles
-    # keeps hitting, so we surface it as an error instead of parsing a fragment.
-    if choice.get("finish_reason") == "length":
-        if max_tokens and max_tokens > 0:
-            raise LLMError(
-                f"model output hit the {max_tokens}-token max_tokens cap and was "
-                "truncated; raise max_tokens (or set it to 0 to use the model's "
-                "full context) or split the step (a partial reply is unsafe to parse)."
-            )
-        raise LLMError(
-            "model output filled the model's context window and was truncated; "
-            "load the model with a larger context in LM Studio or split the step "
-            "(a partial reply is unsafe to parse)."
-        )
-    return content
+    calls: List[Dict] = []
+    for raw in (msg.get("tool_calls") or []):
+        fn = raw.get("function") or {}
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except (ValueError, TypeError):
+            args = {}
+        if not isinstance(args, dict):
+            args = {}
+        calls.append({"id": raw.get("id") or f"call_{len(calls)}",
+                      "name": fn.get("name") or "",
+                      "arguments": args})
+
+    # Truncation still means an unsafe fragment — but only when there is text to
+    # parse; a complete set of tool_calls with finish_reason 'length' is rare and
+    # the structured args are self-delimiting, so we only guard the text path.
+    if choice.get("finish_reason") == "length" and not calls:
+        raise _length_error(max_tokens)
+    return ActReply(content=msg.get("content") or "", tool_calls=calls,
+                    finish_reason=choice.get("finish_reason"))

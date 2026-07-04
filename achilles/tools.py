@@ -19,6 +19,7 @@ honest stance as before — which is exactly why every green step is git-committ
 """
 
 import importlib.util
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,18 +72,36 @@ class ToolContext:
         return _truncate(f"exit={proc.returncode}\n{out}".strip())
 
 
+def _obj(props: dict, required=()) -> dict:
+    """A minimal JSON-Schema object, for native (OpenAI) tool definitions."""
+    return {"type": "object", "properties": props, "required": list(required)}
+
+
+def _str(desc: str) -> dict:
+    return {"type": "string", "description": desc}
+
+
 @dataclass
 class Tool:
     """One capability. `run(args, body, ctx) -> str`; `usage` is the act-block
     example shown to the model. `act=False` marks a CHECK-only tool: dispatchable
     (e.g. by the acceptance phase) but hidden from the act-loop prompt, so the
     model's "hands" stay uncluttered. A check tool returns an `exit=0` line on
-    pass (same convention as run_command) so acceptance can read its verdict."""
+    pass (same convention as run_command) so acceptance can read its verdict.
+
+    `parameters` is the JSON-Schema of the tool's arguments, used when we offer
+    NATIVE tool-calling (the OpenAI `tools` field) to a tool-tuned model. Left
+    None, a permissive schema is synthesised. `body_param` names the one schema
+    field that carries the freeform BODY (write_file's file content) rather than a
+    header arg — so a native tool_call can be mapped back onto the run(args, body)
+    contract the text protocol already uses."""
     name: str
     description: str
     run: Callable[[dict, Optional[str], ToolContext], str]
     usage: str = ""
     act: bool = True
+    parameters: Optional[dict] = None
+    body_param: Optional[str] = None
 
 
 # ---- the four built-in hands ---------------------------------------------
@@ -156,13 +175,22 @@ def _file_contains(args, body, ctx: ToolContext) -> str:
 
 BUILTINS = [
     Tool("read_file", "read a file's contents", _read_file,
-         usage="```act\ntool: read_file\npath: src/foo.py\n```"),
+         usage="```act\ntool: read_file\npath: src/foo.py\n```",
+         parameters=_obj({"path": _str("file path, relative to the workspace")},
+                         ["path"])),
     Tool("list_dir", "list a directory", _list_dir,
-         usage="```act\ntool: list_dir\npath: .\n```"),
+         usage="```act\ntool: list_dir\npath: .\n```",
+         parameters=_obj({"path": _str("directory path, relative to the workspace; "
+                                       "'.' for the root")})),
     Tool("run_command", "run a shell command; see its output and exit code", _run_command,
-         usage="```act\ntool: run_command\ncommand: python -m pytest -q\n```"),
+         usage="```act\ntool: run_command\ncommand: python -m pytest -q\n```",
+         parameters=_obj({"command": _str("the shell command to run")}, ["command"])),
     Tool("write_file", "write a file — the body REPLACES the whole file", _write_file,
-         usage="```act\ntool: write_file\npath: src/foo.py\n---\ndef foo():\n    return 42\n```"),
+         usage="```act\ntool: write_file\npath: src/foo.py\n---\ndef foo():\n    return 42\n```",
+         parameters=_obj({"path": _str("file path, relative to the workspace"),
+                          "content": _str("the COMPLETE new file contents; replaces "
+                                          "the whole file")}, ["path", "content"]),
+         body_param="content"),
     # check-only (acceptance), hidden from the act-loop prompt:
     Tool("file_exists", "pass if a file exists. arg: path", _file_exists, act=False),
     Tool("file_absent", "pass if a file does NOT exist. arg: path", _file_absent, act=False),
@@ -192,15 +220,47 @@ class Registry:
         except Exception as e:   # never let a tool crash the loop
             return f"ERROR: {call.name} failed: {e}"
 
-    def describe(self) -> str:
+    def build_call(self, name: str, arguments: dict) -> ToolCall:
+        """Turn a NATIVE tool_call (name + parsed JSON arguments) into the same
+        ToolCall the text protocol produces, so dispatch() is format-agnostic. The
+        tool's body_param field (if any) is routed to ToolCall.body; the rest stay
+        as header args."""
+        tool = self._tools.get((name or "").lower())
+        args = dict(arguments or {})
+        body = None
+        if tool and tool.body_param and tool.body_param in args:
+            body = args.pop(tool.body_param)
+            if body is not None and not isinstance(body, str):
+                body = str(body)
+        return ToolCall(name=name, args=args, body=body)
+
+    def tool_schemas(self) -> list:
+        """The act-tools as OpenAI `tools` definitions, for native tool-calling.
+        Tools without an explicit schema get a permissive one so they still appear
+        (a native model just gets less guidance on their args)."""
+        out = []
+        for t in self._tools.values():
+            if not t.act:
+                continue
+            params = t.parameters or {"type": "object", "properties": {},
+                                      "additionalProperties": True}
+            out.append({"type": "function",
+                        "function": {"name": t.name,
+                                     "description": t.description,
+                                     "parameters": params}})
+        return out
+
+    def describe(self, include_usage: bool = True) -> str:
         """Render the tool list for the model's system prompt — this is how a new
-        tool announces itself without any prompt edit."""
+        tool announces itself without any prompt edit. In native mode the act-block
+        `usage` examples are omitted (include_usage=False): the JSON schema carries
+        the arg shape, and showing the text format would only muddy the water."""
         parts = []
         for t in self._tools.values():
             if not t.act:        # check-only tools are not "hands"
                 continue
             block = f"- {t.name}: {t.description}"
-            if t.usage:
+            if include_usage and t.usage:
                 block += "\n" + t.usage
             parts.append(block)
         return "\n\n".join(parts)
@@ -223,7 +283,16 @@ def _manifest_tool(spec: dict) -> Tool:
         return ctx.shell(cmd)
 
     usage = spec.get("usage") or f"```act\ntool: {name}\n# fills args into: {template}\n```"
-    return Tool(name, spec.get("description", ""), run, usage)
+    # Derive a native schema from the template's {placeholders}: each is a string
+    # arg, except {body} which maps to the freeform body (like write_file's).
+    placeholders = re.findall(r"\{(\w+)\}", template)
+    props = {p: _str(f"value for {{{p}}}") for p in placeholders if p != "body"}
+    body_param = "body" if "body" in placeholders else None
+    if body_param:
+        props["body"] = _str("freeform body substituted for {body}")
+    parameters = _obj(props, [p for p in props if p != "body"]) if props else None
+    return Tool(name, spec.get("description", ""), run, usage,
+                parameters=parameters, body_param=body_param)
 
 
 def _load_plugins(dir_path: Path, reg: "Registry", log) -> None:
