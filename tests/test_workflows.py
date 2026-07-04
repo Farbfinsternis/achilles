@@ -365,3 +365,37 @@ def test_register_adhoc_rejects_unparseable_reply(tmp_path):
                             chat=_chat("I think it lives somewhere in the graph"))
     assert not rep.ok
     assert any("did not name a prompt node" in e for e in rep.errors)
+
+
+# ---- find_workflow_path / strip_workflow_path (dropped-into-goal) ----------
+
+def test_find_workflow_path_detects_export(tmp_path):
+    p = _write(tmp_path, STD_GRAPH)          # a real ComfyUI export
+    goal = f'baue eine landingpage, verwende diesen workflow "{p}" für die bilder'
+    raw, resolved = wf.find_workflow_path(goal)
+    assert resolved == str(p)
+    assert raw == f'"{p}"'                    # the exact substring, quotes included
+    # bare (unquoted) path is found too
+    raw2, resolved2 = wf.find_workflow_path(f"nutze {p} bitte")
+    assert resolved2 == str(p)
+
+
+def test_find_workflow_path_ignores_non_workflow_json(tmp_path):
+    junk = tmp_path / "config.json"
+    junk.write_text('{"theme": "dark", "port": 8080}', encoding="utf-8")
+    assert wf.find_workflow_path(f"read the settings in {junk} first") is None
+
+
+def test_find_workflow_path_none_when_absent():
+    assert wf.find_workflow_path("just build me a website, no files here") is None
+    assert wf.find_workflow_path("use /does/not/exist/wf.json please") is None
+
+
+def test_strip_workflow_path_tidies_goal(tmp_path):
+    p = _write(tmp_path, STD_GRAPH)
+    goal = f'landingpage bauen, verwende diesen workflow "{p}" für die bilder'
+    raw, _ = wf.find_workflow_path(goal)
+    cleaned = wf.strip_workflow_path(goal, raw)
+    assert str(p) not in cleaned
+    assert '"' not in cleaned                 # the quotes went with it
+    assert cleaned == "landingpage bauen, verwende diesen workflow für die bilder"

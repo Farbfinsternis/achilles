@@ -675,6 +675,40 @@ def register_adhoc(store: Store, path: Path, name: str, config,
     return rep
 
 
+# A .json token in free text: double-quoted, single-quoted, or bare (whitespace-
+# delimited). Terminals quote a dragged path when it has spaces, so quoted forms
+# are tried first. Bare paths with spaces are inherently ambiguous and not our job.
+_JSON_TOKEN_RE = re.compile(r'"([^"]+\.json)"|\'([^\']+\.json)\'|(\S+\.json)', re.I)
+
+
+def find_workflow_path(text: str):
+    """Scan free text (a goal the user typed, perhaps with a dragged-in path) for a
+    ComfyUI workflow. A candidate is a `.json` token that exists on disk AND parses
+    as an API-format export — that parse is the discriminator, so a plain
+    'config.json' mentioned in prose is NOT mistaken for a workflow. Returns
+    (raw_token, resolved_path) for the first match (raw_token is the exact substring
+    to strip from the goal), or None."""
+    for m in _JSON_TOKEN_RE.finditer(text or ""):
+        tok = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+        if not tok:
+            continue
+        try:
+            p = Path(tok).expanduser()
+            if p.is_file():
+                _load_export(p)                 # raises unless it's a ComfyUI graph
+                return m.group(0), str(p)
+        except (WorkflowError, OSError, ValueError):
+            continue
+    return None
+
+
+def strip_workflow_path(text: str, raw_token: str) -> str:
+    """Remove the workflow path (the exact matched substring) from the goal and tidy
+    the whitespace it leaves, so the model's project requirement never carries a raw
+    filesystem path."""
+    return re.sub(r"\s{2,}", " ", (text or "").replace(raw_token, " ")).strip()
+
+
 def apply(store: Store, name: str, prompt: str, aspect: str) -> dict:
     """Return a ready-to-queue graph with the prompt and aspect injected. Called
     BEFORE any VRAM is touched, so a bad aspect fails cheap while the LM is still

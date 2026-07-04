@@ -24,6 +24,9 @@ from .planner import make_plan
 from .protocol import parse_tool_call, ToolCall
 from .tools import build_registry, ToolContext
 from . import style as ui
+from . import workflows as wf
+from . import comfy_client as cc
+from .comfy import _store_dir
 
 
 # The tool list is generated from the registry (so a newly added tool announces
@@ -67,6 +70,12 @@ class Harness:
         self.state_dir.mkdir(exist_ok=True)
         self._maybe_git_init()
 
+        # A user can just write "use this workflow …" and drag the file into the
+        # terminal (which inserts its path). Adopt it as the run's image workflow
+        # and strip the path from the goal BEFORE planning, so the model never sees
+        # a raw filesystem path in its requirement.
+        goal = self._adopt_dropped_workflow(goal)
+
         if not self.cfg.verify_command:
             self.log(ui.warn("⚠  No verify_command set — Achilles has no oracle and is "
                      "flying blind. Steps will be committed without proof. Set "
@@ -106,6 +115,58 @@ class Harness:
 
         # STATE: EXECUTE.
         return self._execute(goal, plan)
+
+    # ---- dropped-workflow adoption (image gen only) -------------------
+
+    def _adopt_dropped_workflow(self, goal: str) -> str:
+        """If the goal carries a path to a ComfyUI workflow (a .json that parses as
+        an API export), register it ad-hoc as the run's default image workflow and
+        return the goal with the path removed. No-op unless image generation is on
+        (comfy_url set) and such a path is actually present. Echo only — the resolved
+        slots are printed for the human to eyeball; the run then proceeds."""
+        if not self.cfg.comfy_url:
+            return goal
+        found = wf.find_workflow_path(goal)
+        if not found:
+            return goal
+        raw, path = found
+        self.log("\n" + ui.muted(f"   … a workflow was included in your request — "
+                                 f"analysing {Path(path).name}"))
+        store = wf.Store(_store_dir(self.cfg))
+        try:
+            rep = wf.register_adhoc(store, Path(path), "_adhoc", self.cfg,
+                                    self._object_info())
+        except wf.WorkflowError as e:
+            self.log(ui.warn(f"   ⚠ could not read the dropped workflow: {e}"))
+            return wf.strip_workflow_path(goal, raw)
+        for note in rep.notes:
+            self.log(ui.warn(f"   ⚠ {note}"))
+        for line in rep.echo:
+            self.log("     " + ui.muted(line))
+        if not rep.ok:
+            self.log(ui.bad("   ✖ the dropped workflow could not be used:"))
+            for err in rep.errors:
+                self.log(ui.bad(f"       · {err}"))
+            self.log(ui.muted("   (continuing without it — an existing default, if any, is used)"))
+            return wf.strip_workflow_path(goal, raw)
+        store.set_default("_adhoc")
+        self.log(ui.ok("   ✔ using the dropped workflow for images (as _adhoc, now default)"))
+        return wf.strip_workflow_path(goal, raw)
+
+    def _object_info(self):
+        """ComfyUI's installed node types (to verify the workflow's custom nodes and
+        read enum options). None if ComfyUI is unreachable — registration still works
+        with name-hint detection, just without the node check."""
+        client = cc.ComfyClient(self.cfg.comfy_url)
+        if not client.reachable():
+            self.log(ui.warn("   ⚠ ComfyUI not reachable — adopting the workflow without "
+                             "the custom-node check."))
+            return None
+        try:
+            return client.object_info()
+        except cc.ComfyError as e:
+            self.log(ui.warn(f"   ⚠ could not read /object_info ({e}) — continuing."))
+            return None
 
     # ---- execution: FLOOR (oracle) then CEILING (Definition of Done) --
 
