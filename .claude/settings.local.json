@@ -6,7 +6,17 @@
       "mcp__visualize__read_me",
       "mcp__visualize__show_widget",
       "Bash(cd \"G:/dev/projects/agent-tests/website\" && echo \"=== ROOT ===\" && ls -la && echo \"=== assets/ ===\" && ls -la assets/ 2>/dev/null | head -60 && echo \"=== any html anywhere ===\" && find . -iname '*.html' -not -path './.git/*' 2>/dev/null)",
-      "Bash(python -c \"import achilles.harness, achilles.repl, achilles.comfy, achilles.workflows, achilles.planner, achilles.acceptance; from achilles.config import load_config; from achilles.tools import build_registry; c=load_config\\('.'\\); r=build_registry\\(c, lambda *_: None\\); print\\('import OK; comfy on:', 'generate_image' in r.names\\(\\)\\)\")"
+      "Bash(python -c \"import achilles.harness, achilles.repl, achilles.comfy, achilles.workflows, achilles.planner, achilles.acceptance; from achilles.config import load_config; from achilles.tools import build_registry; c=load_config\\('.'\\); r=build_registry\\(c, lambda *_: None\\); print\\('import OK; comfy on:', 'generate_image' in r.names\\(\\)\\)\")",
+      "Bash(python -m pytest tests/test_workflows.py -q)",
+      "Bash(python -m pytest tests/ -q)",
+      "Bash(python \"C:\\\\Users\\\\amibl\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\G--dev-projects-achilles\\\\1525cb77-b8fc-4817-968b-3b861633eff4\\\\scratchpad\\\\live_annotate.py\")",
+      "Bash(PYTHONPATH=/g/dev/projects/achilles python \"C:\\\\Users\\\\amibl\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\G--dev-projects-achilles\\\\1525cb77-b8fc-4817-968b-3b861633eff4\\\\scratchpad\\\\live_annotate.py\")",
+      "Bash(PYTHONPATH=/g/dev/projects/achilles PYTHONIOENCODING=utf-8 python \"C:\\\\Users\\\\amibl\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\G--dev-projects-achilles\\\\1525cb77-b8fc-4817-968b-3b861633eff4\\\\scratchpad\\\\live_annotate.py\")",
+      "Bash(PYTHONPATH=/g/dev/projects/achilles PYTHONIOENCODING=utf-8 python \"C:\\\\Users\\\\amibl\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\G--dev-projects-achilles\\\\1525cb77-b8fc-4817-968b-3b861633eff4\\\\scratchpad\\\\diag.py\")",
+      "Bash(PYTHONPATH=/g/dev/projects/achilles PYTHONIOENCODING=utf-8 python \"C:\\\\Users\\\\amibl\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\G--dev-projects-achilles\\\\1525cb77-b8fc-4817-968b-3b861633eff4\\\\scratchpad\\\\live2.py\")",
+      "Bash(PYTHONPATH=/g/dev/projects/achilles python -c ' *)",
+      "Bash(PYTHONPATH=/g/dev/projects/achilles PYTHONIOENCODING=utf-8 python \"C:\\\\Users\\\\amibl\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\G--dev-projects-achilles\\\\1525cb77-b8fc-4817-968b-3b861633eff4\\\\scratchpad\\\\render_test.py\")",
+      "Bash(python -m pytest tests/test_comfy_client.py tests/test_workflows.py -q)"
     ]
   }
 }
