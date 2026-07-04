@@ -18,10 +18,11 @@ class Config:
     base_url: str = "http://localhost:8080/v1"   # llama.cpp server default; Ollama: http://localhost:11434/v1
     api_key: str = "no-key"                       # local servers ignore this
     model: str = "local-model"
-    request_timeout: int = 1800  # seconds to wait for ONE reply. With stream=false the
-                                 # socket read blocks for the whole generation, so this
-                                 # caps a step's total think time — a 12B on modest
-                                 # hardware can chew ~20 min, so default to 30 for headroom.
+    request_timeout: int = 1800  # seconds of silence before Achilles ASKS whether to keep
+                                 # waiting (interactive) — NOT a hard cap: "keep waiting"
+                                 # continues the same generation. No TTY (batch): abort at
+                                 # this mark. 30 min so it only asks when a step is unusually
+                                 # slow (a 12B on modest hardware can legitimately chew ~20).
 
     # --- the oracle (this is the heart of Achilles) ---
     # The command run after every step to decide pass/fail. Empty = no oracle,

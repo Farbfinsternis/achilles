@@ -7,9 +7,17 @@ Ollama's OpenAI-compat port, vLLM, LM Studio, or a cloud API. We use the stdlib
 
 Non-streaming: a plan/act turn is short and we want the whole text before we
 parse it, so streaming would only add complexity here.
+
+Slow-model waiting: a big model on modest hardware can think for many minutes.
+We run the blocking call in a worker thread and give the socket NO hard read
+deadline, so we never kill a healthy in-flight generation. When the wait crosses
+request_timeout we ASK the user whether to keep waiting or abort — and "keep
+waiting" continues the SAME generation, because the connection was never cut.
 """
 
 import json
+import sys
+import threading
 import urllib.error
 import urllib.request
 from typing import List, Dict
@@ -17,6 +25,51 @@ from typing import List, Dict
 
 class LLMError(RuntimeError):
     pass
+
+
+def _ask_keep_waiting(url: str, waited: int) -> bool:
+    """The wait has crossed request_timeout. Ask whether to keep waiting (True) or
+    abort (False), instead of the old behaviour of killing a still-healthy
+    generation. Non-interactive (no TTY): return False so batch runs fail fast
+    rather than block forever on input()."""
+    stdin = getattr(sys, "stdin", None)
+    if stdin is None or not stdin.isatty():
+        return False
+    try:
+        ans = input(f"\n… the model has been working for {waited}s with no reply yet. "
+                    "Keep waiting? [Y/n] ").strip().lower()
+    except EOFError:
+        return False
+    return ans in ("", "y", "yes", "j", "ja")
+
+
+def _request_worker(req, result: Dict) -> None:
+    """Run the blocking, non-streaming HTTP call in a thread so the caller can keep
+    managing the clock. The socket gets NO read deadline (timeout=None), so only
+    the caller's prompt — never a premature timeout — ends a live generation.
+    Stores the raw body text under 'body', or the exception under 'error'."""
+    try:
+        with urllib.request.urlopen(req, timeout=None) as resp:
+            result["body"] = resp.read().decode("utf-8")
+    except BaseException as e:   # re-raised in the caller thread via _llm_error_for
+        result["error"] = e
+
+
+def _llm_error_for(err: BaseException, url: str, config) -> "LLMError":
+    """Map a worker exception to a clean LLMError with an actionable message."""
+    if isinstance(err, urllib.error.HTTPError):
+        detail = err.read().decode("utf-8", "replace")[:500]
+        return LLMError(f"HTTP {err.code} from {url}: {detail}")
+    reason = getattr(err, "reason", None)
+    if isinstance(err, TimeoutError) or isinstance(reason, TimeoutError):
+        return LLMError(
+            f"No response from {url} within request_timeout={config.request_timeout}s. "
+            "The model may still be generating a long reply — raise request_timeout "
+            "in achilles.toml, or cap output with max_tokens.")
+    if isinstance(err, urllib.error.URLError):
+        return LLMError(
+            f"Could not reach {url}: {err.reason}. Is your model server running?")
+    return LLMError(f"Request to {url} failed: {err!r}")
 
 
 def chat(config, messages: List[Dict], temperature: float = 0.2,
@@ -54,35 +107,33 @@ def chat(config, messages: List[Dict], temperature: float = 0.2,
         },
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=config.request_timeout) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", "replace")[:500]
-        raise LLMError(f"HTTP {e.code} from {url}: {detail}") from e
-    except TimeoutError as e:
-        # A slow generation (common now that max_tokens is uncapped and the model
-        # fills its whole context) can outlast request_timeout while the server is
-        # still healthy. This surfaces as a bare TimeoutError during the response
-        # read — NOT a URLError — so catch it explicitly. Left uncaught it crashes
-        # the whole REPL with a raw traceback instead of halting just the step.
-        raise LLMError(
-            f"No response from {url} within request_timeout={config.request_timeout}s. "
-            "The model may still be generating a long reply — raise request_timeout "
-            "in achilles.toml, or cap output with max_tokens."
-        ) from e
-    except urllib.error.URLError as e:
-        # URLError can also wrap a socket timeout (when it fires during connect
-        # rather than read); treat that the same as the bare TimeoutError above.
-        if isinstance(e.reason, TimeoutError):
+    # Run the blocking call in a worker and manage the clock here, so a slow-but-
+    # healthy generation is never killed. Every request_timeout seconds of silence
+    # we ask the human whether to keep waiting; "yes" just joins again — the same
+    # generation is still running on the untouched connection.
+    result: Dict = {}
+    worker = threading.Thread(target=_request_worker, args=(req, result), daemon=True)
+    worker.start()
+    interval = max(1, int(getattr(config, "request_timeout", 300) or 300))
+    waited = 0
+    while True:
+        worker.join(interval)
+        if not worker.is_alive():
+            break
+        waited += interval
+        if not _ask_keep_waiting(url, waited):
             raise LLMError(
-                f"No response from {url} within request_timeout={config.request_timeout}s. "
-                "The model may still be generating a long reply — raise request_timeout "
-                "in achilles.toml, or cap output with max_tokens."
-            ) from e
-        raise LLMError(
-            f"Could not reach {url}: {e.reason}. Is your model server running?"
-        ) from e
+                f"Aborted after waiting {waited}s for a reply from {url}. The model "
+                "may still be generating — re-run to retry, or try a faster model "
+                "or a smaller context.")
+
+    err = result.get("error")
+    if err is not None:
+        raise _llm_error_for(err, url, config) from err
+    try:
+        body = json.loads(result["body"])
+    except (ValueError, KeyError) as e:
+        raise LLMError(f"Could not decode the response from {url}: {e}") from e
 
     try:
         choice = body["choices"][0]

@@ -97,6 +97,55 @@ def test_connect_timeout_wrapped_in_urlerror(monkeypatch):
         chat(_FakeConfig(), [{"role": "user", "content": "hi"}])
 
 
+def test_keeps_waiting_then_returns(monkeypatch):
+    # A slow generation crosses request_timeout once; the user says "keep waiting",
+    # and the SAME call then completes and its content is returned. No restart.
+    import threading
+    release = threading.Event()
+    body = {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+
+    @contextlib.contextmanager
+    def _slow(req, timeout=None):
+        release.wait(2)          # block as if the model were still generating
+        yield io.BytesIO(json.dumps(body).encode("utf-8"))
+    monkeypatch.setattr(llm.urllib.request, "urlopen", _slow)
+
+    asked = []
+
+    def _fake_ask(url, waited):
+        asked.append(waited)
+        release.set()            # let the "still running" generation finish
+        return True
+    monkeypatch.setattr(llm, "_ask_keep_waiting", _fake_ask)
+
+    class _Cfg(_FakeConfig):
+        request_timeout = 0.05   # force at least one keep-waiting check-in
+
+    assert chat(_Cfg(), [{"role": "user", "content": "hi"}]) == "ok"
+    assert asked and asked[0] >= 0.05   # the prompt actually fired
+
+
+def test_abort_while_waiting_raises(monkeypatch):
+    # The user declines to keep waiting → a clean abort, not a hang or a restart.
+    import threading
+    release = threading.Event()
+    body = {"choices": [{"message": {"content": "never read"}}]}
+
+    @contextlib.contextmanager
+    def _slow(req, timeout=None):
+        release.wait(2)
+        yield io.BytesIO(json.dumps(body).encode("utf-8"))
+    monkeypatch.setattr(llm.urllib.request, "urlopen", _slow)
+    monkeypatch.setattr(llm, "_ask_keep_waiting", lambda url, waited: False)
+
+    class _Cfg(_FakeConfig):
+        request_timeout = 0.05
+
+    with pytest.raises(LLMError, match="Aborted"):
+        chat(_Cfg(), [{"role": "user", "content": "hi"}])
+    release.set()   # unblock the orphaned worker so it can exit
+
+
 def test_context_full_truncation_raises(monkeypatch):
     # Uncapped (max_tokens=0) but still truncated → the context window is full;
     # the error must point at the model's context, not a max_tokens cap.
