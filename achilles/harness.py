@@ -210,6 +210,13 @@ class Harness:
         tasks. (2) The FLOOR: a real oracle must be green. (3) The CEILING: the
         Definition of Done, judged and fix-looped until met. Absent a DoD, the
         floor (or a finished plan) is the whole story — the configured fallback."""
+        # Load the Definition of Done FIRST and pin its required file paths, so the
+        # executor names files to match the contract from step one — not after an
+        # acceptance round finds "styles.css" missing because it wrote "style.css".
+        criteria = self._load_dod()
+        from .acceptance import expected_paths
+        self._expected_paths = expected_paths(criteria) if criteria else []
+
         ok, last_verify = self._work_through_plan(goal, plan)
         if not ok:
             return False
@@ -219,7 +226,6 @@ class Harness:
             if not ok:
                 return False
 
-        criteria = self._load_dod()
         if not criteria:
             done_msg = "Oracle green" if self.cfg.verify_command else "All steps done"
             self.log("\n" + ui.ok(f"✔  {done_msg}") + ui.muted(" (no Definition of Done to check)."))
@@ -468,6 +474,19 @@ class Harness:
             "Here is the full plan (for context). Work ONLY on the current task.",
             "",
             checklist,
+        ]
+        # Pin the exact file paths the Definition of Done checks, so the model uses
+        # THESE names instead of inventing its own (styles.css vs style.css). Only
+        # the mechanical exists/contains paths — never the judge criteria, which a
+        # weak model could otherwise game.
+        if getattr(self, "_expected_paths", None):
+            parts += [
+                "",
+                "Required file paths — the Definition of Done checks these EXACT "
+                "paths. When the current task involves one of these files, use this "
+                "exact path; do NOT invent a different name:",
+            ] + [f"- {p}" for p in self._expected_paths]
+        parts += [
             "",
             f"CURRENT TASK: {instruction}",
         ]

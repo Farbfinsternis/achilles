@@ -182,3 +182,21 @@ def test_harness_falls_back_to_text_protocol(tmp_path, monkeypatch):
                             {"role": "user", "content": "u"}])
     assert ok is True
     assert h._native_tools is False                # flipped off for the run
+
+
+def test_work_prompt_pins_dod_paths(tmp_path):
+    # The executor is told the EXACT paths the Definition of Done checks, so it
+    # can't invent styles.css when the contract says style.css.
+    h = H.Harness(_harness_cfg(tmp_path), log=lambda *_: None)
+    h._expected_paths = ["assets/hero.jpg", "style.css"]
+    plan = [{"done": False, "text": "make the page"}]
+    prompt = h._work_prompt("build it", plan, last_verify=None)
+    assert "assets/hero.jpg" in prompt and "style.css" in prompt
+    assert "exact path" in prompt.lower()
+
+
+def test_work_prompt_omits_block_when_no_paths(tmp_path):
+    h = H.Harness(_harness_cfg(tmp_path), log=lambda *_: None)
+    h._expected_paths = []
+    prompt = h._work_prompt("build it", [{"done": False, "text": "x"}], last_verify=None)
+    assert "Required file paths" not in prompt

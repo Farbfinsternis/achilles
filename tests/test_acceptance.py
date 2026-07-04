@@ -10,6 +10,7 @@ import pytest
 from achilles import acceptance
 from achilles.acceptance import (
     parse_acceptance,
+    expected_paths,
     _normalise,
     _parse_verdicts,
     _sanitize_run,
@@ -19,6 +20,32 @@ from achilles.acceptance import (
     JudgeUnavailable,
 )
 from achilles.llm import LLMError
+
+
+# ---- expected_paths (executor ↔ DoD filename coordination) ----------------
+
+def test_expected_paths_collects_exists_and_contains():
+    criteria = [
+        Criterion("exists", "assets/hero.jpg"),
+        Criterion("contains", "index.html :: <canvas"),
+        Criterion("judge", "looks professional"),
+    ]
+    assert expected_paths(criteria) == ["assets/hero.jpg", "index.html"]
+
+
+def test_expected_paths_excludes_absent():
+    # An `absent:` file must NOT exist — it is not a target the executor creates.
+    criteria = [Criterion("exists", "styles.css"), Criterion("absent", "TODO.txt")]
+    assert expected_paths(criteria) == ["styles.css"]
+
+
+def test_expected_paths_dedups_and_handles_fusion():
+    # exists+contains fusion resolves to the same path; it must appear once.
+    criteria = [
+        Criterion("exists", "index.html :: <html"),
+        Criterion("contains", "index.html :: <body"),
+    ]
+    assert expected_paths(criteria) == ["index.html"]
 
 
 # ---- _normalise / parse_acceptance ---------------------------------------

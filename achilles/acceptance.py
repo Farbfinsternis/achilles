@@ -225,6 +225,25 @@ def check(config, criteria: list[Criterion], registry, ctx, log) -> list[Failure
     return failures
 
 
+def expected_paths(criteria: list[Criterion]) -> list[str]:
+    """The file paths the mechanical criteria REQUIRE to exist (exists/contains).
+
+    Handed to the EXECUTOR so it names files to match the contract, instead of each
+    up-front pass inventing its own name and diverging (style.css vs styles.css,
+    hero_bg.jpg vs hero_image.jpg). `absent:` paths are excluded — those must NOT
+    exist — as are judge/run/check, which name no single end-state file."""
+    paths: list[str] = []
+    seen: set[str] = set()
+    for c in criteria:
+        call = _criterion_to_call(c)
+        if call and call.name in ("file_exists", "file_contains"):
+            p = (call.args.get("path") or "").strip()
+            if p and p not in seen:
+                seen.add(p)
+                paths.append(p)
+    return paths
+
+
 def _criterion_to_call(c: Criterion) -> ToolCall | None:
     """Map an acceptance criterion onto a registry ToolCall. This is the bridge
     that unifies acceptance with the tool system: exists/contains/run/check all
