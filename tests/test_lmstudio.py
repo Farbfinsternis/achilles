@@ -147,3 +147,30 @@ def test_ensure_loaded_noop_without_cli(monkeypatch, tmp_path):
     calls = _patch_load_env(monkeypatch, tmp_path, loaded=None, available=False)
     lms.ensure_loaded(_cfg())
     assert calls["loaded"] == []
+
+
+# ---- config.model adoption (the request identifier, not just VRAM) --------
+
+def test_ensure_loaded_adopts_loaded_key_over_placeholder(monkeypatch, tmp_path):
+    # Loading only fills VRAM; the request still sends config.model. Newer LM Studio
+    # rejects "local-model", so config.model must adopt the real loaded key.
+    _patch_load_env(monkeypatch, tmp_path, loaded="google/gemma-4-12b")
+    cfg = _cfg(model="local-model")
+    lms.ensure_loaded(cfg)
+    assert cfg.model == "google/gemma-4-12b"
+
+
+def test_ensure_loaded_keeps_user_set_model_id(monkeypatch, tmp_path):
+    # A real, user-chosen id is never overridden by whatever happens to be loaded.
+    _patch_load_env(monkeypatch, tmp_path, loaded="google/gemma-4-12b")
+    cfg = _cfg(model="qwen2.5-coder-7b-instruct")
+    lms.ensure_loaded(cfg)
+    assert cfg.model == "qwen2.5-coder-7b-instruct"
+
+
+def test_ensure_loaded_adopts_key_after_restoring_remembered(monkeypatch, tmp_path):
+    _patch_load_env(monkeypatch, tmp_path, loaded=None)
+    lms.remember_model("google/gemma-4-12b")
+    cfg = _cfg(model="local-model")
+    lms.ensure_loaded(cfg)
+    assert cfg.model == "google/gemma-4-12b"          # adopted the one it loaded

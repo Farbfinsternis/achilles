@@ -72,10 +72,10 @@ def loaded_llm(lms_command: str = "lms") -> Optional[str]:
     """Return the model-key of the currently loaded chat model, or None.
 
     We reload THIS exact key after an image render, not config.model — config.model
-    is often a placeholder (LM Studio's `base_url` serves whatever is loaded, so the
-    OpenAI `model` field can stay "local-model"), and `lms load local-model` then
-    fails with "Model not found". Query `lms ps` while the model is still resident,
-    before unload, to learn its real key.
+    is often a placeholder (users leave the OpenAI `model` field as "local-model";
+    ensure_loaded then adopts the real loaded key so requests stay valid), and
+    `lms load local-model` would fail with "Model not found". Query `lms ps` while
+    the model is still resident, before unload, to learn its real key.
 
     Best-effort: any failure (CLI error, unexpected JSON, nothing loaded) returns
     None so the caller can fall back to config.model rather than crash the swap.
@@ -131,6 +131,7 @@ def ensure_loaded(config, log: Callable[[str], None] = print) -> None:
     current = loaded_llm(config.lms_command)
     if current:
         remember_model(current)
+        _adopt_model_id(config, current)
         return
     target = last_remembered() or _real_key(getattr(config, "model", ""))
     if not target:
@@ -141,8 +142,20 @@ def ensure_loaded(config, log: Callable[[str], None] = print) -> None:
     try:
         _run(config.lms_command, "load", target, "-y")
         remember_model(target)
+        _adopt_model_id(config, target)
     except LMStudioError as e:
         log(f"   ⚠ could not load {target}: {e}")
+
+
+def _adopt_model_id(config, key: str) -> None:
+    """Point config.model at the model that is ACTUALLY loaded, when config.model is
+    just the placeholder. Loading a model (above) only fills VRAM; the chat request
+    still sends config.model as the OpenAI `model` field, and newer LM Studio
+    REJECTS an unknown id like "local-model" ("Invalid model identifier") instead of
+    leniently serving whatever is loaded. Adopting the real key closes that gap. A
+    real, user-set model id is left untouched."""
+    if key and not _real_key(getattr(config, "model", "")):
+        config.model = key
 
 
 def unload_all(lms_command: str = "lms", log: Callable[[str], None] = print) -> None:
