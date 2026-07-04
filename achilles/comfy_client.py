@@ -46,6 +46,13 @@ class ComfyClient:
         except urllib.error.URLError as e:
             raise ComfyError(f"Could not reach ComfyUI at {url}: {e.reason}. "
                              "Is ComfyUI running?") from e
+        except OSError as e:
+            # A bare ConnectionResetError/timeout from the socket layer is NOT a
+            # URLError, so it would otherwise escape as a raw traceback and crash
+            # the run mid-poll. This is exactly how a mid-render ComfyUI OOM/crash
+            # shows up — report it as a ComfyError so the tool's finally still runs.
+            raise ComfyError(f"Lost the connection to ComfyUI at {url}: {e}. "
+                             "Did ComfyUI crash or run out of VRAM mid-render?") from e
 
     def _get_json(self, path: str) -> dict:
         return json.loads(self._get(path).decode("utf-8"))
@@ -66,6 +73,9 @@ class ComfyClient:
         except urllib.error.URLError as e:
             raise ComfyError(f"Could not reach ComfyUI at {url}: {e.reason}. "
                              "Is ComfyUI running?") from e
+        except OSError as e:
+            raise ComfyError(f"Lost the connection to ComfyUI at {url}: {e}. "
+                             "Did ComfyUI crash or run out of VRAM mid-render?") from e
 
     # ---- the five endpoints -------------------------------------------
 
