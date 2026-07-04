@@ -91,6 +91,12 @@ def build_tool(config) -> Tool:
         target = ctx.resolve(path)
         target.parent.mkdir(parents=True, exist_ok=True)
 
+        # Learn the REAL loaded model-key before we unload it, so the reload below
+        # restores exactly what the user had — not config.model, which is often a
+        # placeholder ("local-model") that `lms load` can't resolve. Falls back to
+        # config.model if detection turns up nothing.
+        reload_target = lmstudio.loaded_llm(config.lms_command) or config.model
+
         try:
             lmstudio.unload_all(config.lms_command, ctx_log)
             prompt_id = client.queue_prompt(graph)
@@ -115,7 +121,7 @@ def build_tool(config) -> Tool:
                 ctx_log(f"   ⚠ could not free ComfyUI VRAM: {e}")
             # The one guarantee that matters: the brain always comes back.
             try:
-                lmstudio.load(config.model, config.lms_command, ctx_log)
+                lmstudio.load(reload_target, config.lms_command, ctx_log)
             except lmstudio.LMStudioError as e:
                 ctx_log(f"   ⚠ could not reload LM Studio model: {e}")
 

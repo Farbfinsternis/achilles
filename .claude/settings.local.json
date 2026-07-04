@@ -22,7 +22,12 @@
       "Bash(python -m pytest -q)",
       "Bash(python -m pytest tests/test_llm.py -q)",
       "Bash(PYTHONIOENCODING=utf-8 python -m pytest -q)",
-      "Bash(PYTHONIOENCODING=utf-8 python -m pytest -q --ignore=examples)"
+      "Bash(PYTHONIOENCODING=utf-8 python -m pytest -q --ignore=examples)",
+      "Bash(lms ps *)",
+      "Bash(echo \"---EXIT $?---\")",
+      "Bash(lms load *)",
+      "Bash(lms ls *)",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); [print\\(m.get\\('modelKey'\\) or m.get\\('path'\\) or m\\) for m in \\(d if isinstance\\(d,list\\) else d.get\\('models',[]\\)\\)]\")"
     ]
   }
 }

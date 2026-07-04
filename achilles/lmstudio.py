@@ -14,9 +14,10 @@ try/finally and the finally calls `load()`. This module only provides the two
 verbs and an availability check to fail *before* we ever unload.
 """
 
+import json
 import shutil
 import subprocess
-from typing import Callable
+from typing import Callable, Optional
 
 
 class LMStudioError(RuntimeError):
@@ -46,6 +47,31 @@ def _run(lms_command: str, *args: str, timeout: int = 300) -> str:
         detail = (proc.stderr or proc.stdout or "").strip()[:500]
         raise LMStudioError(f"`{lms_command} {' '.join(args)}` failed: {detail}")
     return (proc.stdout or "").strip()
+
+
+def loaded_llm(lms_command: str = "lms") -> Optional[str]:
+    """Return the model-key of the currently loaded chat model, or None.
+
+    We reload THIS exact key after an image render, not config.model — config.model
+    is often a placeholder (LM Studio's `base_url` serves whatever is loaded, so the
+    OpenAI `model` field can stay "local-model"), and `lms load local-model` then
+    fails with "Model not found". Query `lms ps` while the model is still resident,
+    before unload, to learn its real key.
+
+    Best-effort: any failure (CLI error, unexpected JSON, nothing loaded) returns
+    None so the caller can fall back to config.model rather than crash the swap.
+    Embedding models are skipped — we only care about the chat model we displace."""
+    try:
+        out = _run(lms_command, "ps", "--json")
+        entries = json.loads(out) if out else []
+    except (LMStudioError, json.JSONDecodeError):
+        return None
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("type") == "llm":
+            key = entry.get("modelKey") or entry.get("identifier")
+            if key:
+                return key
+    return None
 
 
 def unload_all(lms_command: str = "lms", log: Callable[[str], None] = print) -> None:
