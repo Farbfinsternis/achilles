@@ -8,8 +8,10 @@
 base_url = "http://localhost:1234/v1"
 api_key  = "no-key"            # LM Studio ignores this
 model    = "local-model"       # your model's identifier in LM Studio
-request_timeout = 900          # seconds to wait for one reply. Raise it further if a
-                               # slow model generating long, uncapped output times out.
+request_timeout = 1800         # seconds to wait for one reply. With stream=false this
+                               # caps a whole step's think time — a 12B on modest hardware
+                               # can take ~20 min, so 30 gives headroom. Raise it further
+                               # if a bigger/slower model still times out mid-step.
 
 # --- ComfyUI image generation (optional, OFF by default) ---
 # Set comfy_url to give the model a `generate_image` hand: Achilles unloads the

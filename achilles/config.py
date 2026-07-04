@@ -18,7 +18,10 @@ class Config:
     base_url: str = "http://localhost:8080/v1"   # llama.cpp server default; Ollama: http://localhost:11434/v1
     api_key: str = "no-key"                       # local servers ignore this
     model: str = "local-model"
-    request_timeout: int = 900   # slow local models generating long, uncapped output need headroom
+    request_timeout: int = 1800  # seconds to wait for ONE reply. With stream=false the
+                                 # socket read blocks for the whole generation, so this
+                                 # caps a step's total think time — a 12B on modest
+                                 # hardware can chew ~20 min, so default to 30 for headroom.
 
     # --- the oracle (this is the heart of Achilles) ---
     # The command run after every step to decide pass/fail. Empty = no oracle,
