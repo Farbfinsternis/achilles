@@ -40,10 +40,12 @@ _USAGE = (
     "```"
 )
 _DESCRIPTION = (
-    "generate a REAL raster image (JPG/PNG) and save it into the workspace. This "
-    "is the ONLY correct way to produce a picture, photo, image or illustration. "
-    "Do NOT hand-write an SVG, a CSS gradient, or a placeholder as a substitute — "
-    "for ANY image the task asks for, call this tool. prompt: English, "
+    "render a REAL raster image — a photo, illustration, texture or hero background "
+    "— with an image model and save it as JPG/PNG. Use this whenever the task wants "
+    "a photograph or a painted/realistic picture: it produces actual pixels, which "
+    "markup cannot, so it beats settling for a flat placeholder. For a VECTOR "
+    "graphic instead — an SVG icon, logo, simple diagram or line art — write the SVG "
+    "markup with write_file; that is the right tool for those. prompt: English, "
     "descriptive. path: where to save it (e.g. assets/hero.jpg). aspect: square | "
     "landscape | portrait (optional, default landscape). workflow: only if the "
     "user named one, else omit."
@@ -65,6 +67,13 @@ def build_tool(config) -> Tool:
             return "ERROR: generate_image needs a `prompt` (English, descriptive)."
         if not path:
             return "ERROR: generate_image needs a `path` to save the image to."
+        # A weak model routes an SVG here because it "is an image". But this tool
+        # renders raster pixels — writing them to a .svg would corrupt it. Redirect
+        # to the right hand, cheaply, before any VRAM swap.
+        if path.lower().endswith(".svg"):
+            return ("ERROR: generate_image only makes raster images (JPG/PNG). An SVG "
+                    "is vector markup — write the SVG yourself with the write_file "
+                    "tool instead of rendering it here.")
         if not name:
             # Not a model-fixable error — a human must register a workflow. Say so
             # plainly; the harness-level setup-halt is a later refinement.
