@@ -33,7 +33,19 @@ from .comfy import _store_dir
 
 # The tool list is generated from the registry (so a newly added tool announces
 # itself with no prompt edit). {tools} is filled in at run time.
-EXECUTE_SYSTEM_TEMPLATE = """You are Achilles, a coding agent working in ONE small step of a larger plan.
+
+# Shared across both protocols: a web page MAY pull frameworks and fonts from a
+# CDN. Framed as a permission (never a ban — per the positive-framing rule), with
+# concrete URLs so a weak model doesn't invent a broken one. Nothing is downloaded
+# locally; the browser fetches it, so this needs no network tool.
+_WEB_ASSETS_RULE = (
+    "- For a web page you MAY load CSS/JS frameworks and web fonts from a CDN — link "
+    "them in the HTML <head>; you don't need to download or vendor them. Good picks: "
+    "Tailwind CSS (<script src=\"https://cdn.tailwindcss.com\"></script>) and Google "
+    "Fonts (a <link> to https://fonts.googleapis.com, then use the font-family in your CSS)."
+)
+
+EXECUTE_SYSTEM_TEMPLATE = ("""You are Achilles, a coding agent working in ONE small step of a larger plan.
 
 To use a tool, output a single fenced block tagged `act`, with `key: value`
 headers and (for write_file) a `---` body. Your tools:
@@ -52,13 +64,14 @@ Rules:
 - The `write_file` body REPLACES the whole file, so include the complete file.
 - If the file you write itself contains ``` code fences (e.g. a Markdown README),
   wrap the WHOLE act block in ~~~act … ~~~ instead of ``` so the inner fences are
-  not mistaken for the end of your block."""
+  not mistaken for the end of your block.
+""" + _WEB_ASSETS_RULE)
 
 
 # The native-tool-calling variant: the tools arrive as real functions (the OpenAI
 # `tools` field), so the model calls them directly and we drop the fence syntax.
 # The behavioural rules are the same — only the "how to act" part differs.
-NATIVE_SYSTEM_TEMPLATE = """You are Achilles, a coding agent working in ONE small step of a larger plan.
+NATIVE_SYSTEM_TEMPLATE = ("""You are Achilles, a coding agent working in ONE small step of a larger plan.
 
 You have these tools, provided to you as callable functions — call them directly:
 
@@ -72,7 +85,8 @@ Rules:
 - write_file's `content` REPLACES the whole file, so pass the complete file.
 - When the current step is fully implemented, STOP: reply with a short plain
   sentence and NO tool call. Do NOT claim success — the harness verifies itself.
-- Keep changes minimal and focused on the current step only."""
+- Keep changes minimal and focused on the current step only.
+""" + _WEB_ASSETS_RULE)
 
 
 class Harness:

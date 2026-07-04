@@ -200,3 +200,14 @@ def test_work_prompt_omits_block_when_no_paths(tmp_path):
     h._expected_paths = []
     prompt = h._work_prompt("build it", [{"done": False, "text": "x"}], last_verify=None)
     assert "Required file paths" not in prompt
+
+
+def test_system_prompt_permits_cdn_and_google_fonts(tmp_path):
+    # The CDN/font permission must reach BOTH protocol variants — a web-capable
+    # model shouldn't be stuck vendoring Tailwind or a font it could just link.
+    h = H.Harness(_harness_cfg(tmp_path), log=lambda *_: None)
+    for native in (True, False):
+        h._native_tools = native
+        prompt = h._system_prompt()
+        assert "cdn.tailwindcss.com" in prompt
+        assert "fonts.googleapis.com" in prompt
