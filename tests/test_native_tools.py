@@ -202,6 +202,36 @@ def test_work_prompt_omits_block_when_no_paths(tmp_path):
     assert "Required file paths" not in prompt
 
 
+def test_log_result_prints_receipts(tmp_path):
+    # The user must SEE what each tool call did, not just that one happened.
+    from achilles.protocol import ToolCall
+    logs = []
+    h = H.Harness(_harness_cfg(tmp_path), log=logs.append)
+    h._log_result(ToolCall("write_file", {"path": "a.py"}), "OK: wrote a.py (3 lines)")
+    h._log_result(ToolCall("read_file", {"path": "b.py"}), "l1\nl2\nl3")
+    h._log_result(ToolCall("run_command", {"command": "pytest"}), "exit=1\nboom")
+    joined = "\n".join(logs)
+    assert "OK: wrote a.py (3 lines)" in joined      # write shows its status line
+    assert "read b.py (3 lines)" in joined            # read is summarised, not dumped
+    assert "exit=1" in joined                          # a failure is surfaced
+
+
+def test_native_execution_logs_a_receipt(tmp_path, monkeypatch):
+    # End-to-end: the receipt appears on the real native act path, after dispatch.
+    logs = []
+    h = H.Harness(_harness_cfg(tmp_path), log=logs.append)
+    replies = iter([
+        ActReply(content="", tool_calls=[
+            {"id": "c1", "name": "write_file",
+             "arguments": {"path": "foo.txt", "content": "hi"}}]),
+        ActReply(content="done", tool_calls=[]),
+    ])
+    monkeypatch.setattr(H, "complete_act", lambda *a, **k: next(replies))
+    h._act_until_done([{"role": "system", "content": "s"},
+                       {"role": "user", "content": "u"}])
+    assert any("wrote foo.txt" in m for m in logs)
+
+
 def test_system_prompt_permits_cdn_and_google_fonts(tmp_path):
     # The CDN/font permission must reach BOTH protocol variants — a web-capable
     # model shouldn't be stuck vendoring Tailwind or a font it could just link.

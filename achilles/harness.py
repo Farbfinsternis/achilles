@@ -422,6 +422,7 @@ class Harness:
                     call = self.registry.build_call(tc["name"], tc["arguments"])
                     self._log_act(call)
                     result = self.registry.dispatch(call, self.ctx)
+                    self._log_result(call, result)
                     messages.append({"role": "tool", "tool_call_id": tc["id"],
                                      "content": result})
                 continue
@@ -448,6 +449,7 @@ class Harness:
             self._log_act(call)
             messages.append({"role": "assistant", "content": reply_text})
             result = self.registry.dispatch(call, self.ctx)
+            self._log_result(call, result)
             messages.append({"role": "user", "content": f"[tool result: {call.name}]\n{result}"})
         self.log(ui.muted("   (hit max acts for this step — verifying what we have)"))
         return True
@@ -455,6 +457,32 @@ class Harness:
     def _log_act(self, call: ToolCall) -> None:
         self.log("   " + ui.muted("act>") + " " + ui.accent(call.name) + " "
                  + (call.args.get("path", call.args.get("command", "")) or ""))
+
+    def _log_result(self, call: ToolCall, result: str) -> None:
+        """Print a one-line RECEIPT for a tool call, so the human sees what actually
+        happened — not just that an action was taken. Without this, a write_file
+        with no visible outcome (or a silent error) left the user in the dark. The
+        tool result otherwise only ever goes to the model. read_file's result IS the
+        file content, so it's summarised, not dumped; everything else shows its
+        status line, coloured by success/failure."""
+        text = result or ""
+        if call.name == "read_file":
+            n = len(text.splitlines())
+            self.log("        " + ui.muted(f"↳ read {call.args.get('path', '')} ({n} lines)"))
+            return
+        first = next((ln for ln in text.splitlines() if ln.strip()), "")
+        if not first:
+            self.log("        " + ui.muted("↳ (no output)"))
+            return
+        if len(first) > 120:
+            first = first[:119] + "…"
+        if first.startswith("OK") or first.startswith("exit=0"):
+            paint = ui.ok
+        elif first.startswith("ERROR") or first.startswith("exit=") or "not found" in first.lower():
+            paint = ui.bad
+        else:
+            paint = ui.muted
+        self.log("        " + paint(f"↳ {first}"))
 
     @staticmethod
     def _assistant_tool_msg(reply: ActReply) -> dict:
