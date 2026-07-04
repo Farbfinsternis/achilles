@@ -88,5 +88,8 @@ def make_plan(config, goal: str, tree: str) -> List[str]:
         {"role": "system", "content": system},
         {"role": "user", "content": PLAN_USER_TEMPLATE.format(tree=tree, goal=goal)},
     ]
-    reply = chat(config, messages, temperature=config.temperature, max_tokens=1024)
+    # No hard token cap here: reasoning models spend tokens on thinking before
+    # the checklist, so a fixed cap (1024) truncated them mid-plan. Fall back to
+    # config.max_tokens (0 = use the model's own context window).
+    reply = chat(config, messages, temperature=config.temperature)
     return parse_checklist(reply)

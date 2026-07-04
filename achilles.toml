@@ -8,13 +8,15 @@
 base_url = "http://localhost:1234/v1"
 api_key  = "no-key"            # LM Studio ignores this
 model    = "local-model"       # your model's identifier in LM Studio
+request_timeout = 900          # seconds to wait for one reply. Raise it further if a
+                               # slow model generating long, uncapped output times out.
 
 # --- ComfyUI image generation (optional, OFF by default) ---
 # Set comfy_url to give the model a `generate_image` hand: Achilles unloads the
 # LM Studio model, renders via ComfyUI, then reloads the model. Leaving it empty
 # keeps the tool (and the planner/acceptance image nudges) disabled. Register a
 # workflow once (:workflow register <api-export.json>) and it becomes the default.
-comfy_url   = ""               # e.g. "http://127.0.0.1:8188" to enable
+comfy_url   = "http://127.0.0.1:8188"               # e.g. "http://127.0.0.1:8188" to enable
 lms_command = "lms"            # LM Studio CLI used to swap the model in/out
 
 # --- the oracle: THE most important line ---
@@ -44,6 +46,13 @@ max_accept_rounds    = 3       # fix→re-judge rounds before halting on unmet c
 judge_model          = ""
 
 temperature = 0.2
+# Hard ceiling on tokens generated per act turn. 0 = auto: Achilles sends NO cap,
+# so LM Studio (or llama.cpp) fills the loaded model's own remaining context
+# window. Leave it at 0 unless you want to deliberately throttle output length —
+# a fixed cap once truncated whole-file writes mid-stream and halted the run.
+# If output still truncates at 0, the model's context window is full: reload it
+# with a larger context in LM Studio.
+max_tokens = 0
 
 # --- the tool registry (the model's hands, extensible) ---
 # The model always has the four built-in tools (read_file, write_file, list_dir,

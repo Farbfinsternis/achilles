@@ -49,6 +49,13 @@ einen OpenAI-kompatiblen Endpunkt anbietet. Beispiel llama.cpp:
 **2. `achilles.toml` anpassen** — vor allem `model`, `base_url` und das
 **`verify_command`** (das Orakel). Ohne Orakel rät Achilles nur.
 
+> **Kontextfenster statt Token-Cap:** `max_tokens = 0` (Default) sendet *kein*
+> eigenes Limit — die Engine füllt das Kontextfenster des geladenen Modells.
+> Lade das Modell darum mit ausreichend Kontext (llama.cpp `-c 65536`, in LM
+> Studio die Context-Length hochsetzen), sonst brechen ganze Datei-Schreibvorgänge
+> mittendrin ab. Einen festen Deckel nur setzen, wenn du Output bewusst drosseln
+> willst.
+
 **3. Das mitgelieferte Beispiel ausprobieren** (zeigt die Schleife end-to-end):
 
 ```

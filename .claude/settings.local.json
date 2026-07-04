@@ -18,7 +18,11 @@
       "Bash(PYTHONPATH=/g/dev/projects/achilles PYTHONIOENCODING=utf-8 python \"C:\\\\Users\\\\amibl\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\G--dev-projects-achilles\\\\1525cb77-b8fc-4817-968b-3b861633eff4\\\\scratchpad\\\\render_test.py\")",
       "Bash(python -m pytest tests/test_comfy_client.py tests/test_workflows.py -q)",
       "Bash(git add *)",
-      "Bash(PYTHONPATH=/g/dev/projects/achilles PYTHONIOENCODING=utf-8 python \"C:\\\\Users\\\\amibl\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\G--dev-projects-achilles\\\\1525cb77-b8fc-4817-968b-3b861633eff4\\\\scratchpad\\\\render_via_goal.py\")"
+      "Bash(PYTHONPATH=/g/dev/projects/achilles PYTHONIOENCODING=utf-8 python \"C:\\\\Users\\\\amibl\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\G--dev-projects-achilles\\\\1525cb77-b8fc-4817-968b-3b861633eff4\\\\scratchpad\\\\render_via_goal.py\")",
+      "Bash(python -m pytest -q)",
+      "Bash(python -m pytest tests/test_llm.py -q)",
+      "Bash(PYTHONIOENCODING=utf-8 python -m pytest -q)",
+      "Bash(PYTHONIOENCODING=utf-8 python -m pytest -q --ignore=examples)"
     ]
   }
 }

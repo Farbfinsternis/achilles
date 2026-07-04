@@ -18,7 +18,7 @@ class Config:
     base_url: str = "http://localhost:8080/v1"   # llama.cpp server default; Ollama: http://localhost:11434/v1
     api_key: str = "no-key"                       # local servers ignore this
     model: str = "local-model"
-    request_timeout: int = 300
+    request_timeout: int = 900   # slow local models generating long, uncapped output need headroom
 
     # --- the oracle (this is the heart of Achilles) ---
     # The command run after every step to decide pass/fail. Empty = no oracle,
@@ -67,6 +67,12 @@ class Config:
 
     # --- generation ---
     temperature: float = 0.2
+    # Hard ceiling on tokens generated per act turn. 0 = auto: don't send a cap
+    # at all, so the engine (LM Studio, llama.cpp, …) fills the model's own
+    # remaining context window. A fixed cap here silently truncated whole-file
+    # writes at 2048 tokens; letting the server decide adopts the model's real
+    # limit. Set a positive value only to deliberately throttle output length.
+    max_tokens: int = 0
 
     @property
     def workspace_path(self) -> Path:

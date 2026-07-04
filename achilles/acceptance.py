@@ -185,7 +185,9 @@ def make_acceptance(config, goal: str, tree: str) -> list[Criterion]:
         {"role": "system", "content": system},
         {"role": "user", "content": ACCEPT_USER_TEMPLATE.format(tree=tree, goal=goal)},
     ]
-    reply = chat(config, messages, temperature=config.temperature, max_tokens=1024)
+    # No hard token cap: reasoning models spend tokens thinking before the list,
+    # so a fixed cap truncated them. Falls back to config.max_tokens (0 = uncapped).
+    reply = chat(config, messages, temperature=config.temperature)
     # The model must never author an executable command or a raw tool-call — it
     # cannot do it reliably. Keep only the kinds the HARNESS checks robustly;
     # run:/check: survive only in a HUMAN-written done.md.
@@ -331,7 +333,9 @@ def _judge(config, items: list[Criterion], ctx, log) -> list[tuple[bool, str]]:
     ]
     try:
         # temperature 0 — judging should be as deterministic as the model allows.
-        reply = chat(config, messages, temperature=0.0, max_tokens=1024,
+        # No hard token cap: reasoning judge models need room to think before the
+        # verdict. Falls back to config.max_tokens (0 = uncapped).
+        reply = chat(config, messages, temperature=0.0,
                      model=config.judge_model or None)
     except LLMError as e:
         # NOT a content FAIL — the judge server is down/unreachable. Signal the
