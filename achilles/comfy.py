@@ -25,7 +25,23 @@ from pathlib import Path
 from . import comfy_client as cc
 from . import lmstudio
 from . import workflows as wf
+from .llm import chat, LLMError
 from .tools import Tool, ToolContext
+
+
+# The image step is prompt-engineering, not coding — so it gets its OWN persona
+# rather than riding the generic "coding agent" act-prompt. A dedicated call (while
+# the LM is still loaded, before the VRAM swap) rewrites the model's terse brief
+# into a dense diffusion prompt. Faithful by instruction: it enriches style, never
+# swaps the subject. Best-effort — any failure falls back to the raw brief.
+_IMG_PROMPT_SYSTEM = (
+    "You are a prompt engineer for a text-to-image diffusion model. Rewrite the "
+    "brief into ONE dense, comma-separated English prompt that a diffusion model "
+    "renders well. KEEP the exact subject and every specific detail from the brief, "
+    "then enrich it with concrete style, composition, lighting, colour and mood "
+    "cues plus a couple of quality tags. Stay faithful — never add unrelated "
+    "subjects, characters or text. Output ONLY the prompt: no preamble, no quotes."
+)
 
 
 # Shown to the model in its tool list. Deliberately evocative: a weak model won't
@@ -80,6 +96,11 @@ def build_tool(config) -> Tool:
             return ("SETUP NEEDED: no ComfyUI workflow is registered yet. A human "
                     "must run  :workflow register <path-to-api-export.json>  and  "
                     ":workflow default <name>  once. Cannot generate images until then.")
+
+        # Refine the brief into a richer diffusion prompt via the prompt-engineer
+        # persona — while the LM is still loaded, before the swap. Faithful + best
+        # effort: on any failure it returns the brief unchanged.
+        prompt = _engineer_prompt(config, prompt, aspect, ctx_log)
 
         # Resolve the graph BEFORE touching VRAM: a bad aspect or missing workflow
         # fails here, cheaply, with the LM still loaded.
@@ -156,6 +177,26 @@ def build_tool(config) -> Tool:
         "required": ["prompt", "path"],
     }
     return Tool("generate_image", _DESCRIPTION, run, usage=_USAGE, parameters=parameters)
+
+
+def _engineer_prompt(config, raw: str, aspect: str, log) -> str:
+    """Rewrite the model's terse image brief into a richer diffusion prompt under a
+    dedicated prompt-engineer persona. A separate chat() call, made while the LM is
+    still resident (before the image swap). Best-effort: an LLM error or an empty
+    reply returns the raw brief unchanged, so image generation never hinges on it."""
+    try:
+        out = chat(config, [
+            {"role": "system", "content": _IMG_PROMPT_SYSTEM},
+            {"role": "user", "content": f"Aspect: {aspect}.\nBrief: {raw}"},
+        ], temperature=getattr(config, "temperature", 0.2))
+    except LLMError:
+        return raw
+    out = (out or "").strip().strip('"').strip()
+    if not out:
+        return raw
+    if out != raw:
+        log(f"   ✎ image prompt → {out}")
+    return out
 
 
 def _store_dir(config) -> Path:
