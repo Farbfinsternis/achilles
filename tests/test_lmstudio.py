@@ -100,7 +100,7 @@ def _patch_load_env(monkeypatch, tmp_path, *, loaded, available=True):
     (None = nothing loaded), and a captured record of any `lms load` invocation."""
     _redirect_state(monkeypatch, tmp_path)
     monkeypatch.setattr(lms, "available", lambda cmd="lms": available)
-    calls = {"loaded": []}
+    calls = {"loaded": [], "unloaded": []}
 
     def fake_run(lms_command, *args, timeout=300):
         if args[:1] == ("ps",):
@@ -108,6 +108,9 @@ def _patch_load_env(monkeypatch, tmp_path, *, loaded, available=True):
             return json.dumps(entries)
         if args[:1] == ("load",):
             calls["loaded"].append(args[1])
+            return ""
+        if args[:1] == ("unload",):
+            calls["unloaded"].append(args)
             return ""
         raise AssertionError(f"unexpected lms call: {args}")
 
@@ -160,12 +163,33 @@ def test_ensure_loaded_adopts_loaded_key_over_placeholder(monkeypatch, tmp_path)
     assert cfg.model == "google/gemma-4-12b"
 
 
-def test_ensure_loaded_keeps_user_set_model_id(monkeypatch, tmp_path):
-    # A real, user-chosen id is never overridden by whatever happens to be loaded.
-    _patch_load_env(monkeypatch, tmp_path, loaded="google/gemma-4-12b")
+def test_ensure_loaded_switches_to_user_set_model(monkeypatch, tmp_path):
+    # A real, user-chosen id different from what's loaded SWITCHES the resident model
+    # (unload the old, load the chosen) so `:model X` actually takes effect — and the
+    # id is never overridden by whatever happened to be loaded.
+    calls = _patch_load_env(monkeypatch, tmp_path, loaded="google/gemma-4-12b")
     cfg = _cfg(model="qwen2.5-coder-7b-instruct")
     lms.ensure_loaded(cfg)
+    assert calls["loaded"] == ["qwen2.5-coder-7b-instruct"]   # switched to the choice
+    assert calls["unloaded"]                                   # freed VRAM first
     assert cfg.model == "qwen2.5-coder-7b-instruct"
+
+
+def test_ensure_loaded_noop_when_user_model_already_loaded(monkeypatch, tmp_path):
+    # The chosen model is already resident → no unload/reload churn.
+    calls = _patch_load_env(monkeypatch, tmp_path, loaded="ornith-1.0-9b")
+    lms.ensure_loaded(_cfg(model="ornith-1.0-9b"))
+    assert calls["loaded"] == [] and calls["unloaded"] == []
+
+
+def test_ensure_loaded_prefers_explicit_model_over_remembered(monkeypatch, tmp_path):
+    # The reported bug: `:model ornith-1.0-9b` set a real key, but with nothing loaded
+    # ensure_loaded restored the last-remembered gemma instead of loading the choice.
+    calls = _patch_load_env(monkeypatch, tmp_path, loaded=None)
+    lms.remember_model("google/gemma-4-e4b")             # the previously used model
+    lms.ensure_loaded(_cfg(model="ornith-1.0-9b"))       # user switched via :model
+    assert calls["loaded"] == ["ornith-1.0-9b"]          # loaded the CHOSEN one
+    assert calls["unloaded"] == []                        # nothing to free (cold start)
 
 
 def test_ensure_loaded_adopts_key_after_restoring_remembered(monkeypatch, tmp_path):

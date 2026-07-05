@@ -116,24 +116,49 @@ def last_remembered() -> Optional[str]:
 
 
 def ensure_loaded(config, log: Callable[[str], None] = print) -> None:
-    """Guarantee a chat model is resident before Achilles ever calls it.
+    """Guarantee the RIGHT chat model is resident before Achilles ever calls it.
 
-    LM Studio can sit with NOTHING loaded — a fresh launch, or after our own image
-    swap died mid-render. Every LLM call then 400s with "No models loaded" and the
-    run dies before it starts. So at startup: if a model is loaded, just remember
-    it; if not, load the last one we saw (the model the user actually used), and
-    only fall back to config.model when that is a real key.
+    An explicitly chosen model WINS. If config.model is a real key (set in
+    achilles.toml or the REPL's `:model`), that model must be the loaded one — if a
+    different model is resident, or none is, we switch to it. Otherwise `:model X`
+    would silently keep running whatever was loaded (or last remembered) before.
+
+    Only when config.model is the placeholder do we keep whatever is loaded, or —
+    for a cold LM Studio (fresh launch, or after our own image swap died mid-render,
+    which 400s every call with "No models loaded") — restore the last model we saw.
 
     Best-effort and silent on the happy path — it never raises, so a genuinely
     unresolvable state still reaches llm.py's clear error instead of a traceback."""
     if not available(config.lms_command):
         return  # no `lms` CLI: we can't manage models; llm.py reports the rest
     current = loaded_llm(config.lms_command)
+    desired = _real_key(getattr(config, "model", ""))
+
+    # An explicit, real choice beats inertia (what's loaded) AND the last-remembered
+    # model — the reported bug was `:model ornith` still running the loaded gemma.
+    if desired:
+        if current == desired:
+            remember_model(desired)
+            return
+        try:
+            if current:
+                # Free VRAM first: a second big model can't co-reside on a small card.
+                log(f"   switching model {current} → {desired}…")
+                unload_all(config.lms_command, log)
+            else:
+                log(f"   no model loaded — loading {desired}…")
+            _run(config.lms_command, "load", desired, "-y")
+            remember_model(desired)
+        except LMStudioError as e:
+            log(f"   ⚠ could not load {desired}: {e}")
+        return
+
+    # No explicit choice (placeholder): keep what's loaded, or restore last used.
     if current:
         remember_model(current)
         _adopt_model_id(config, current)
         return
-    target = last_remembered() or _real_key(getattr(config, "model", ""))
+    target = last_remembered()
     if not target:
         log("   ⚠ no model loaded in LM Studio and none remembered — load one "
             "(`lms load`) or set a real `model` in achilles.toml.")
