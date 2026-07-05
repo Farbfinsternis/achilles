@@ -51,6 +51,30 @@ def test_eof_on_first_line_raises(monkeypatch):
         Repl(None)._read_line()
 
 
+def test_paste_is_coalesced_into_one_goal(monkeypatch):
+    # A pasted multi-line block (no backslashes) must become ONE goal, not one goal
+    # per line — the fragmentation bug where each stray line got its own run.
+    _feed(monkeypatch, ["Build a landing page", "with a hero section", "and a footer"])
+    r = Repl(None)
+    pending = iter([True, True, False])          # two lines buffered, then done
+    monkeypatch.setattr(r, "_input_pending", lambda: next(pending))
+    assert r._read_line() == "Build a landing page\nwith a hero section\nand a footer"
+
+
+def test_typed_line_not_coalesced_when_nothing_pending(monkeypatch):
+    # Nothing buffered after the line (human typing) → a plain single-line goal.
+    _feed(monkeypatch, ["first goal"])
+    r = Repl(None)
+    monkeypatch.setattr(r, "_input_pending", lambda: False)
+    assert r._read_line() == "first goal"
+
+
+def test_input_pending_false_for_non_tty(monkeypatch):
+    # The guard that keeps coalescing from ever firing on piped/captured stdin.
+    monkeypatch.setattr(R.sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
+    assert Repl(None)._input_pending() is False
+
+
 def test_startup_resolves_model_before_showing_config(monkeypatch, capsys):
     # The config table must show the real loaded model, not the placeholder: run()
     # calls ensure_loaded (which adopts config.model) BEFORE _show_config.

@@ -12,6 +12,8 @@ Lines beginning with ':' are meta-commands. They steer the SESSION and never
 reach the model. Everything else is a goal narrated in plain words.
 """
 
+import os
+import sys
 from pathlib import Path
 
 from .config import Config
@@ -90,11 +92,15 @@ class Repl:
         return 0
 
     def _read_line(self) -> str:
-        """Read one goal, allowing MULTI-LINE entry: a line ending with a backslash
-        continues on the next, and the break becomes a real newline in the goal. A
-        plain Enter still submits a single-line goal, exactly as before — so nothing
-        changes for the common case. Ctrl-D on the FIRST line quits; on a
-        continuation it submits whatever was typed so far."""
+        """Read one goal, allowing MULTI-LINE entry two ways:
+          * a line ending with a backslash continues on the next, and the break
+            becomes a real newline in the goal;
+          * a multi-line PASTE is coalesced into ONE goal. Without this each pasted
+            line submitted its own Harness.run(), so a big prompt got chopped into
+            fragments and the model planned against a single stray line.
+        A plain Enter still submits a single-line goal — nothing changes for the
+        common case. Ctrl-D on the FIRST line quits; on a continuation it submits
+        whatever was typed so far."""
         prompt = "\n" + ui.paint("achilles>", "bold", "cyan") + " "
         cont = ui.paint("      ...>", "bold", "cyan") + " "
         buf: list[str] = []
@@ -109,8 +115,34 @@ class Repl:
                 buf.append(chunk[:-1])
                 continue
             buf.append(chunk)
+            # A paste delivers all its lines at once, so the rest are already
+            # buffered right now; pull them into the SAME goal. Human typing leaves
+            # nothing pending between lines, so separately-typed goals never merge.
+            while self._input_pending():
+                try:
+                    buf.append(input())
+                except EOFError:
+                    break
             break
         return "\n".join(buf).strip()
+
+    @staticmethod
+    def _input_pending() -> bool:
+        """True when the terminal already has more input buffered — the tell-tale of
+        a multi-line PASTE (typing leaves nothing pending between lines). Best-effort
+        and cross-platform; any uncertainty (non-tty, unsupported, error) returns
+        False, so lines a human entered as separate goals are never merged."""
+        stdin = getattr(sys, "stdin", None)
+        try:
+            if stdin is None or not stdin.isatty():
+                return False
+            if os.name == "nt":
+                import msvcrt
+                return bool(msvcrt.kbhit())
+            import select
+            return bool(select.select([stdin], [], [], 0)[0])
+        except Exception:
+            return False
 
     # ---- meta-commands ------------------------------------------------
 
