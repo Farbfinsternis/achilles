@@ -9,7 +9,60 @@ Schritten schreiben — und stützt sich auf ein **Verifikations-Orakel**
 (Tests/Compiler) plus eine **Definition of Done**, damit ein schwaches Modell
 nicht beim ersten Versuch recht haben muss. Es muss nur **konvergieren**.
 
-## Die Idee in einem Satz
+---
+
+## Quickstart
+
+Du willst Achilles einfach nur schnell ausprobieren? Hier ist der kürzeste Weg:
+
+### 1. Vorbereitung
+Für diesen Quickstart benötigen wir:
+- **Python 3.11+**: Bitte stelle sicher, dass eine aktuelle Python-Version installiert ist.
+- **[LM Studio](https://lmstudio.ai/)**: Lade es herunter, installiere es und starte den lokalen Server. Lade dir dort ein Modell deiner Wahl herunter.
+
+### 2. Achilles herunterladen und installieren
+Öffne ein Terminal und lade das Projekt herunter:
+```bash
+git clone https://github.com/Farbfinsternis/achilles.git
+```
+
+Wechsle nun in das heruntergeladene Verzeichnis. 
+*(Windows-Tipp: Öffne den Ordner `achilles` im Windows Explorer, klicke oben in die Adresszeile, tippe `cmd` ein und drücke Enter. So öffnet sich das Terminal direkt im richtigen Pfad!)*
+
+Mache Achilles nun global auf deinem System verfügbar, indem du folgenden Befehl ausführst:
+```bash
+pip install -e .
+```
+*(Das `-e` sorgt dafür, dass Achilles sich automatisch aktualisiert, falls du später den Code im Ordner veränderst.)*
+
+### 3. Achilles starten und Modell verbinden
+Starte Achilles, indem du einfach Folgendes in dein Terminal eingibst:
+```bash
+achilles
+```
+
+Wechsle kurz zu LM Studio. Gehe in die Liste deiner Modelle, klicke auf dein geladenes Modell und wähle **"Copy Model Identifier"** (oder kopiere den genauen Namen). 
+Gehe zurück in dein Terminal zu Achilles und tippe:
+```bash
+:model <Dein_kopierter_Identifier>
+```
+*(z.B.: `:model lmstudio-community/Meta-Llama-3-8B-Instruct-GGUF`)*
+
+### 4. Loslegen!
+Jetzt kannst du deinen ersten Prompt eingeben, z.B.:
+> "Schreibe mir ein kleines Python-Skript, das das aktuelle Datum ausgibt."
+
+**Wichtiger Hinweis:** Achilles arbeitet mit *lokalen* Modellen. Diese brauchen für ihre Denk- und Programmierschritte deutlich länger als riesige Frontier-Modelle (wie GPT-4 oder Claude 3.5 Sonnet) in der Cloud. Hab also ein wenig Geduld, während Achilles arbeitet!
+
+### Bonus: Bilder generieren mit ComfyUI
+Wenn du [ComfyUI](https://github.com/comfyanonymous/ComfyUI) installiert hast, kannst du dem Modell erlauben, Bilder für dich zu generieren!
+1. Erstelle in ComfyUI deinen gewünschten Workflow.
+2. Speichere ihn als **API Workflow** (als `.json` Datei exportieren).
+3. Ziehe diese JSON-Datei per **Drag & Drop** einfach direkt in das Terminal, in dem du gerade mit Achilles schreibst!
+
+---
+
+## Die Idee hinter Achilles
 
 > Das Modell ist klug, aber vergesslich. Der Harness ist dumm, aber zuverlässig.
 > Also verlagern wir jede Last, mit der das Modell schlecht umgeht, **aus dem
@@ -28,7 +81,7 @@ Nichts davon braucht ein kluges Modell. Es braucht eine kluge **Schleife**.
 
 ## Aufbau (jede Datei = ein Konzept)
 
-```
+```text
 achilles/
   protocol.py      Der Format-Vertrag: parst ```act-Blöcke aus dem Modell-Text.
   tools.py         Die Hände: read_file, write_file, list_dir, run_command (erweiterbare Registry).
@@ -44,90 +97,12 @@ achilles/
   workflows.py     Registrierung/Anwendung markierter ComfyUI-Workflows.
 ```
 
-## Abhängigkeiten
+## Abhängigkeiten für Entwickler
 
 - **Python 3.11+** (für `tomllib` aus der Standardbibliothek).
-- **Keine Runtime-Abhängigkeiten.** Achilles nutzt ausschließlich die stdlib
-  (`urllib` für HTTP, `tomllib` für Config). Das ist Absicht — ein minimaler
-  Harness soll nichts zu installieren haben.
-- **Ein OpenAI-kompatibler LLM-Server**, den du selbst betreibst:
-  [LM Studio](https://lmstudio.ai), [llama.cpp](https://github.com/ggml-org/llama.cpp),
-  [Ollama](https://ollama.com) oder [vLLM](https://github.com/vllm-project/vllm).
+- **Keine Runtime-Abhängigkeiten.** Achilles nutzt ausschließlich die stdlib.
+- **Ein OpenAI-kompatibler LLM-Server**, den du selbst betreibst (z.B. LM Studio, llama.cpp, Ollama).
 - Optional **`pytest`** — nur für die Testsuite und das mitgelieferte Beispiel.
-- Optional für Bildgenerierung: **[ComfyUI](https://github.com/comfyanonymous/ComfyUI)**
-  und die **LM-Studio-CLI (`lms`)** (zum VRAM-Swap auf kleinen Karten).
-
-## Installation / Build
-
-Es gibt nichts zu bauen. Zum direkten Ausführen genügt Python 3.11+:
-
-```
-python -m achilles "…dein ziel…" -w pfad/zum/projekt
-```
-
-Um `achilles` als echten Befehl von überall aufrufbar zu machen, einmalig im
-Repo-Root:
-
-```
-pip install -e .
-```
-
-`-e` (editable) heißt: der Befehl folgt deinen Quell-Änderungen, ohne dass du neu
-installieren musst. Danach liegt `achilles` im PATH und der Workspace-Default ist
-das **aktuelle Verzeichnis** — genau der Ablauf „in ein Projekt wechseln,
-`achilles` tippen".
-
-## Schnellstart
-
-**1. Ein lokales Modell servieren**, das einen OpenAI-kompatiblen Endpunkt
-anbietet. Beispiel llama.cpp:
-
-```
-./llama-server -m ornith-9b.gguf -c 65536 --port 8080
-```
-
-**2. `achilles.toml` anpassen** — vor allem `model`, `base_url` und das
-**`verify_command`** (das Orakel). Ohne Orakel rät Achilles nur.
-
-> **Kontextfenster statt Token-Cap:** `max_tokens = 0` (Default) sendet *kein*
-> eigenes Limit — die Engine füllt das Kontextfenster des geladenen Modells. Lade
-> das Modell darum mit ausreichend Kontext (llama.cpp `-c 65536`, in LM Studio die
-> Context-Length hochsetzen), sonst brechen ganze Datei-Schreibvorgänge mittendrin
-> ab. Einen festen Deckel nur setzen, wenn du Output bewusst drosseln willst.
-
-**3. Das mitgelieferte Beispiel ausprobieren** (zeigt die Schleife end-to-end):
-
-```
-pip install pytest
-cd examples/kata
-python ../../__main__.py "make the failing tests pass" --verify "python -m pytest -q" -y
-```
-
-Du solltest sehen, wie Achilles plant, `mathx.py` schreibt, die Tests laufen lässt
-und den Balken grün macht — jeder Schritt committet.
-
-**4. An einem echten Projekt:**
-
-```
-python -m achilles "füge einen zweiten Gegnertyp hinzu, der springt" -w pfad/zum/projekt
-```
-
-Du **erzählst**, was du willst. Die Zerlegung in kleine Schritte macht der
-Planungs-Pass — genau das, was ein Frontier-Modell sonst still im Kopf erledigt.
-
-### CLI-Optionen
-
-```
-python -m achilles [ziel …] [optionen]
-
-  -w, --workspace <pfad>   Projektverzeichnis (Default: aktuelles).
-  -y, --yes                Den erzeugten Plan automatisch bestätigen.
-      --verify <cmd>       Orakel-Befehl setzen/überschreiben.
-      --no-acceptance      Definition-of-Done-Phase überspringen (nur das Orakel).
-      --no-git             Git-Checkpoints deaktivieren.
-```
-
-Ohne Ziel startet Achilles die interaktive Sitzung (REPL, siehe unten).
 
 ## Das Act-Protokoll & Constrained Decoding
 
@@ -147,67 +122,24 @@ die reichere Anfrage ablehnt — es bricht nie hart ab.
 
 ## Definition of Done (die „Decke")
 
-Das `verify_command` ist der **Boden**: es beweist, dass nichts *kaputt* ist. Es
-sagt nichts darüber, ob das **Ziel** erreicht wurde — für generative Aufgaben
-(„baue eine Landingpage für …") ist der Boden trivial erfüllbar.
+Das `verify_command` (das Orakel) in der `achilles.toml` ist der **Boden**: es beweist, dass nichts *kaputt* ist. Darum erzeugt ein zweiter Planungs-Pass eine `.achilles/done.md` mit Akzeptanzkriterien:
 
-Darum erzeugt ein zweiter Planungs-Pass eine `.achilles/done.md` mit
-Akzeptanzkriterien, je nach Prüfart getaggt:
-
-```
+```text
 - [ ] exists:   <pfad>              (der Harness prüft os.path)
 - [ ] contains: <pfad> :: <text>    (der Harness prüft Teilstring)
 - [ ] judge:    <klartext>          (das Modell als strenger, kontext-isolierter Prüfer)
 ```
 
-Der Harness prüft die Kriterien und schickt gezielte Fixes, bis sie erfüllt sind
-(oder es bei ausbleibendem Fortschritt sauber abbricht und das klemmende Kriterium
-benennt). Die `done.md` ist editierbar — du kannst Kriterien entschärfen und
-erneut starten. Mit `--no-acceptance` bzw. `use_acceptance = false` bleibt es beim
-Orakel-Boden.
-
-## Bildgenerierung mit ComfyUI (optional)
-
-Setzt du `comfy_url` in `achilles.toml`, bekommt das Modell eine `generate_image`-
-Hand. Der Ablauf ist atomar: Achilles entlädt das LM-Studio-Modell, rendert über
-ComfyUI, holt den VRAM zurück und lädt das Modell wieder (auch wenn ein Render
-scheitert). Der knappe Bild-Brief des Modells wird zuvor von einer **Prompt-
-Engineer-Persona** in einen dichten Diffusion-Prompt verfeinert.
-
-Workflows verwaltest du in der REPL (ein Node im API-Export wird als
-`achilles:prompt` bzw. `achilles:aspect` markiert):
-
-```
-achilles> :workflow register <pfad-zum-api-export.json>   # markierten Workflow prüfen + speichern
-achilles> :workflow try <pfad>                            # Modell die Nodes selbst finden lassen
-achilles> :workflow default <name>                        # Standard-Workflow setzen
-achilles> :workflow list                                  # registrierte Workflows (★ = Default)
-```
+Der Harness prüft die Kriterien und schickt gezielte Fixes, bis sie erfüllt sind.
 
 ## Interaktive Sitzung (REPL)
 
-Statt eines einzelnen Ziels kannst du eine laufende Sitzung starten — lass das
-Ziel einfach weg:
-
-```
-python -m achilles -w pfad/zum/projekt
+Du kannst Achilles jederzeit ohne festes Ziel starten:
+```bash
+achilles -w pfad/zum/projekt
 ```
 
-Jede Klartext-Zeile ist ein Ziel und läuft durch dieselbe `act → verify →
-commit`-Schleife. Was über mehrere Ziele **erhalten bleibt**, sind Config,
-Workspace und das Git-Repo — du kannst also mehrere Aufgaben hintereinander
-aufgeben, das Modell wechseln oder den Workspace umstellen, ohne den Prozess neu
-zu starten. Ein mehrzeiliges Ziel kannst du direkt **einfügen** (es wird als ein
-Ziel erkannt) oder eine Zeile mit `\` fortsetzen. Zeilen, die mit `:` beginnen,
-steuern die Sitzung und gehen **nie** ans Modell:
-
-```
-achilles> :verify python -m pytest -q     # das Orakel zur Laufzeit setzen
-achilles> make the failing tests pass     # ein Ziel — Plan, Schleife, grün, commit
-achilles> :status                         # wie viele Plan-Schritte sind erledigt?
-achilles> :model ornith-1.0-9b            # Modell für die Sitzung wechseln (lädt/schaltet um)
-achilles> :quit
-```
+Jede Zeile ist ein neues Ziel. Was über mehrere Ziele erhalten bleibt, sind Config, Workspace und das Git-Repo. Zeilen, die mit `:` beginnen, steuern die Sitzung und gehen nie ans Modell:
 
 | Befehl | Wirkung |
 |---|---|
@@ -222,46 +154,28 @@ achilles> :quit
 | `:status` | erledigte vs. offene Plan-Schritte |
 | `:quit` (oder Strg-D) | Sitzung beenden |
 
-Der Plan ist **ans Ziel gebunden**: Gibst du dasselbe Ziel erneut ein (oder
-startest neu), wird ein unterbrochener Lauf *fortgesetzt*; bei einem neuen Ziel
-wird der alte Plan nach `.achilles/plan.<n>.md` archiviert und frisch geplant. Das
-gilt auch für die one-shot-CLI.
-
 ## Konfiguration (`achilles.toml`)
 
-Config wird geschichtet, von global nach spezifisch (später gewinnt): die
-mitgelieferte `achilles.toml` neben dem Paket → `~/.achilles.toml` →
-`<workspace>/achilles.toml`. Jedes Feld ist zusätzlich per Umgebungsvariable
-überschreibbar (`ACHILLES_MODEL=…`, `ACHILLES_VERIFY_COMMAND=…`, …).
-
+Die Config wird geschichtet geladen (Paket → `~/.achilles.toml` → `<workspace>/achilles.toml`). 
 Die wichtigsten Felder:
 
 | Feld | Bedeutung |
 |---|---|
 | `base_url`, `api_key`, `model` | der OpenAI-kompatible Endpunkt und das Modell |
 | `verify_command` | das Orakel, nach jedem Schritt ausgeführt (leer = blind) |
-| `act_protocol` | `"native"` \| `"json"` \| `"text"` (siehe oben) |
-| `use_acceptance`, `max_accept_rounds` | Definition of Done an/aus, Fix-Runden |
-| `judge_model` | optional ein stärkeres Modell nur für den Judge |
-| `use_git` | grüne Schritte committen (billiger Rollback) |
-| `max_tokens` | `0` = Kontextfenster des Modells füllen (empfohlen) |
-| `temperature` | Sampling-Temperatur |
-| `comfy_url`, `lms_command`, `workflows_dir` | Bildgenerierung (optional) |
+| `act_protocol` | `"native"` \| `"json"` \| `"text"` |
+| `use_acceptance` | Definition of Done an/aus |
+| `use_git` | grüne Schritte committen |
 
 ## Tests
 
-```
+```bash
 pip install pytest
 python -m pytest tests/ -q
 ```
 
 ## Was bewusst (noch) fehlt
 
-Bewusst weggelassen, weil später dran:
-
-- **Repo-Map / Code-Retrieval** (tree-sitter + Abhängigkeitsgraph) statt das
-  Modell selbst suchen zu lassen.
+- **Repo-Map / Code-Retrieval** (tree-sitter + Abhängigkeitsgraph)
 - **Semantische Output-Kürzung** (Stacktrace behalten, grünes Rauschen wegwerfen).
 - **Echter Kontext-/Token-Budgetierer** (`n_ctx` messen, trimmen).
-
-Die Architektur lässt für jedes davon bewusst Platz.
