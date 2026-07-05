@@ -14,7 +14,7 @@ from achilles.llm import LLMError
 
 def _cfg(tmp_path):
     return types.SimpleNamespace(
-        workspace_path=tmp_path, native_tools=True, tools=[], tools_dir="",
+        workspace_path=tmp_path, act_protocol="native", tools=[], tools_dir="",
         comfy_url="", max_acts_per_step=6, temperature=0.2, max_tokens=0,
         auto_approve_plan=False)
 

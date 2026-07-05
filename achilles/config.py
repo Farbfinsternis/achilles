@@ -49,8 +49,12 @@ class Config:
     # How many characters of workspace text the judge sees. Too small and files
     # get trimmed/omitted, so the judge can't cite evidence and wrongly FAILs
     # correct work. Raise it toward your model's context window (~4 chars/token);
-    # lower it if the judge overflows. per_file caps any single file's slice.
-    judge_char_budget: int = 24000
+    # lower it if the judge overflows. per_file caps any single file's slice —
+    # EXCEPT the files the contract names (exists/contains), which are shown whole up
+    # to the total budget, so a single self-contained page isn't trimmed out from
+    # under a true criterion. The total gives room for one full page plus a few
+    # smaller files.
+    judge_char_budget: int = 32000
     judge_char_per_file: int = 6000
 
     # --- the tool registry (the model's hands, extensible) ---
@@ -78,13 +82,19 @@ class Config:
     # limit. Set a positive value only to deliberately throttle output length.
     max_tokens: int = 0
 
-    # Offer NATIVE (OpenAI) tool-calling: send the tools as a JSON schema and read
-    # back structured tool_calls. Tool-tuned models (even small 4B ones) drive the
-    # act-loop far better this way than with the text `act` protocol they were
-    # never trained on. On by default, with an automatic fallback: if the server
-    # rejects the tools field, or the model answers in prose, Achilles parses the
-    # text `act` block instead — so nothing breaks on a server/model without it.
-    native_tools: bool = True
+    # How the model drives its tools in the act-loop:
+    #   "native" — OpenAI tool-calling: the tools go out as a JSON schema and
+    #              structured tool_calls come back. Best for tool-tuned models.
+    #   "json"   — constrained content-JSON: the model emits ONE JSON object per
+    #              turn and the server grammar-enforces its shape via
+    #              response_format=json_schema. This is the reliable path for a weak
+    #              4B on LM Studio, whose tool-call `arguments` channel is NOT
+    #              grammar-constrained even though the content channel IS. The model
+    #              stops a step by emitting {"tool": "finish"}.
+    #   "text"   — the fenced ```act``` text protocol; the universal fallback.
+    # Whatever the choice, Achilles degrades to "text" mid-run if the server rejects
+    # the richer request (or the model answers in prose), so nothing hard-breaks.
+    act_protocol: str = "native"
 
     @property
     def workspace_path(self) -> Path:
@@ -105,6 +115,11 @@ def _apply_toml(cfg: Config, path: Path) -> None:
         # config layers rather than overwriting.
         if key == "tool" and isinstance(val, list):
             cfg.tools.extend(val)
+            continue
+        # Legacy: native_tools (bool) was replaced by act_protocol (string). Keep an
+        # old config meaningful — native_tools=false meant the text protocol.
+        if key == "native_tools":
+            cfg.act_protocol = "native" if val else "text"
             continue
         if hasattr(cfg, key):
             setattr(cfg, key, val)

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Callable, List
 
 from .config import Config
-from .llm import chat, complete_act, ActReply, LLMError
+from .llm import chat, complete_act, complete_json, ActReply, LLMError
 from .planner import make_plan, revise_plan
 from .protocol import parse_tool_call, ToolCall
 from .tools import build_registry, ToolContext
@@ -45,6 +45,16 @@ _WEB_ASSETS_RULE = (
     "Fonts (a <link> to https://fonts.googleapis.com, then use the font-family in your CSS)."
 )
 
+# Keep files small (backlog #14). One big file is the failure amplifier: it overflows
+# read_file's cap (so a whole-file rewrite loses the tail) AND the judge's per-file
+# budget (so true criteria FAIL unseen). Steer the act model to split concerns.
+_SMALL_FILES_RULE = (
+    "\n- Keep each file small and focused. For a web page put the CSS in its own .css "
+    "file and the JS in its own .js file and link them from the HTML, rather than "
+    "inlining everything into one large file — small files are easier to edit "
+    "correctly in a single step."
+)
+
 EXECUTE_SYSTEM_TEMPLATE = ("""You are Achilles, a coding agent working in ONE small step of a larger plan.
 
 To use a tool, output a single fenced block tagged `act`, with `key: value`
@@ -65,7 +75,7 @@ Rules:
 - If the file you write itself contains ``` code fences (e.g. a Markdown README),
   wrap the WHOLE act block in ~~~act … ~~~ instead of ``` so the inner fences are
   not mistaken for the end of your block.
-""" + _WEB_ASSETS_RULE)
+""" + _WEB_ASSETS_RULE + _SMALL_FILES_RULE)
 
 
 # The native-tool-calling variant: the tools arrive as real functions (the OpenAI
@@ -86,7 +96,32 @@ Rules:
 - When the current step is fully implemented, STOP: reply with a short plain
   sentence and NO tool call. Do NOT claim success — the harness verifies itself.
 - Keep changes minimal and focused on the current step only.
-""" + _WEB_ASSETS_RULE)
+""" + _WEB_ASSETS_RULE + _SMALL_FILES_RULE)
+
+
+# The constrained-content-JSON variant (act_protocol="json"): the server
+# grammar-forces every reply into a single JSON object (response_format=
+# json_schema), so the "how to act" instruction is about that object's fields, and
+# the model stops a step with a "finish" sentinel instead of prose. This is the
+# path that gives a weak 4B on LM Studio real format enforcement — its tool-call
+# arguments channel is not grammar-constrained, but the content channel is.
+JSON_SYSTEM_TEMPLATE = ("""You are Achilles, a coding agent working in ONE small step of a larger plan.
+
+Reply with a SINGLE JSON object and nothing else — its shape is enforced for you.
+The "tool" field picks ONE tool to run this turn; the other fields carry that
+tool's arguments. Your tools:
+
+{tools}
+
+Rules:
+- Take ONE action per message: one JSON object, then wait for its result.
+- Read before you write. Don't guess a file's contents — read_file it first.
+- To CREATE or CHANGE a file, use write_file with "path" and the COMPLETE new file
+  in "content" (it REPLACES the whole file).
+- When the current step is fully implemented, reply with {{"tool": "finish"}}. Do NOT
+  claim success in prose — the harness verifies itself.
+- Keep changes minimal and focused on the current step only.
+""" + _WEB_ASSETS_RULE + _SMALL_FILES_RULE)
 
 
 class Harness:
@@ -96,11 +131,12 @@ class Harness:
         self.ws = config.workspace_path
         self.ctx = ToolContext(self.ws)
         self.registry = build_registry(config, log)
-        # Native tool-calling is on unless config says otherwise; the schema is
-        # built once. _native_tools may flip to False mid-run if the server turns
-        # out not to accept the tools field (see _act_until_done).
-        self._native_tools = getattr(config, "native_tools", True)
+        # The act protocol: "native" | "json" | "text". Both schemas are built once;
+        # only one is used per the choice. _protocol may DEGRADE to "text" mid-run if
+        # the server rejects the richer request (see _act_until_done).
+        self._protocol = self._normalize_protocol(getattr(config, "act_protocol", "native"))
         self._tool_schema = self.registry.tool_schemas()
+        self._act_schema = self.registry.content_json_schema()
         self.state_dir = self.ws / ".achilles"
         self.plan_path = self.state_dir / "plan.md"
         self.dod_path = self.state_dir / "done.md"
@@ -372,65 +408,102 @@ class Harness:
         ]
         return self._act_until_done(messages)
 
+    @staticmethod
+    def _normalize_protocol(p: str) -> str:
+        p = (p or "native").strip().lower()
+        return p if p in ("native", "json", "text") else "native"
+
+    def _degrade_to_text(self, why: str) -> None:
+        """Fall back to the text protocol for the rest of the run and rebuild the
+        system prompt to match. Used when the server rejects the richer request
+        (native tools field, or response_format) — the text protocol works anywhere."""
+        self._protocol = "text"
+        self.log(ui.muted(f"   ({why} — falling back to the text protocol)"))
+
     def _system_prompt(self) -> str:
-        """The act-loop system prompt, matched to the current protocol: native
-        tool-calling drops the fence syntax and the usage examples (the JSON schema
-        carries the arg shape), the text protocol keeps both."""
-        tools = self.registry.describe(include_usage=not self._native_tools)
-        template = NATIVE_SYSTEM_TEMPLATE if self._native_tools else EXECUTE_SYSTEM_TEMPLATE
-        return template.format(tools=tools)
+        """The act-loop system prompt, matched to the current protocol. native and
+        json both drop the fence usage examples (the schema/grammar carries the arg
+        shape); only the text protocol shows the ```act``` syntax."""
+        if self._protocol == "text":
+            return EXECUTE_SYSTEM_TEMPLATE.format(
+                tools=self.registry.describe(include_usage=True))
+        template = JSON_SYSTEM_TEMPLATE if self._protocol == "json" else NATIVE_SYSTEM_TEMPLATE
+        return template.format(tools=self.registry.describe(include_usage=False))
 
     def _act_until_done(self, messages: List[dict]) -> bool:
         """Inner loop: let the model take actions until it stops acting.
 
-        Native tool-calling first (structured tool_calls), with the text `act`
-        protocol as the fallback — for a model that answers in prose, and for a
-        whole run if the server rejects the tools field. Returns True when the
-        model finished acting (or hit the act ceiling), False when a model error
-        aborted the turn — so an outage is never mistaken for a completed step."""
+        Three protocols share this loop. "native" reads structured tool_calls;
+        "json" reads a grammar-forced content-JSON object; "text" parses an `act`
+        fence. native and json both DEGRADE to text if the server rejects their
+        richer request. Each iteration ends with either a single ToolCall to run or
+        a 'no action' reply (→ nudge-once, then done). Returns True when the model
+        finished acting (or hit the act ceiling), False when a model error aborted
+        the turn — so an outage is never mistaken for a completed step."""
         acted = False
         nudged = False
         for _ in range(self.cfg.max_acts_per_step):
-            if self._native_tools:
+            call = None
+            reply_text = ""
+
+            if self._protocol == "native":
                 try:
                     reply = complete_act(self.cfg, messages, self._tool_schema,
                                          temperature=self.cfg.temperature)
-                except LLMError as e:
-                    # The server may not accept the tools field. Drop native for the
-                    # rest of this run and retry the SAME turn on the text protocol;
-                    # if the error was something else (e.g. no model loaded) the
-                    # retry surfaces it cleanly.
-                    self._native_tools = False
-                    self.log(ui.muted("   (native tool-calling unavailable — "
-                                      "falling back to the text protocol)"))
+                except LLMError:
+                    # The server may not accept the tools field; drop to text and
+                    # retry the SAME turn. A different error (e.g. no model loaded)
+                    # then surfaces cleanly on the text path.
+                    self._degrade_to_text("native tool-calling unavailable")
                     messages[0]["content"] = self._system_prompt()
                     continue
-            else:
+                # Native can emit MULTIPLE calls: run each, threading a tool-role
+                # result back (the shape the native protocol wants), then loop.
+                if reply.tool_calls:
+                    acted = True
+                    messages.append(self._assistant_tool_msg(reply))
+                    for tc in reply.tool_calls:
+                        c = self.registry.build_call(tc["name"], tc["arguments"])
+                        self._log_act(c)
+                        result = self.registry.dispatch(c, self.ctx)
+                        self._log_result(c, result)
+                        messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                         "content": result})
+                    continue
+                reply_text = reply.content
+
+            elif self._protocol == "json":
                 try:
-                    text = chat(self.cfg, messages, temperature=self.cfg.temperature)
+                    jr = complete_json(self.cfg, messages, self._act_schema,
+                                       temperature=self.cfg.temperature)
+                except LLMError:
+                    # response_format unsupported (or another failure): degrade to
+                    # text and retry; a real outage surfaces there.
+                    self._degrade_to_text("constrained JSON unavailable")
+                    messages[0]["content"] = self._system_prompt()
+                    continue
+                reply_text = jr.content
+                if jr.obj is not None:
+                    tool = (jr.obj.get("tool") or "").strip()
+                    if tool and tool != "finish":
+                        args = {k: v for k, v in jr.obj.items() if k != "tool"}
+                        call = self.registry.build_call(tool, args)
+                    # tool == "finish" (or missing): no call → the 'no action' tail
+                    # reads it as the model stopping, exactly like text-mode prose.
+                else:
+                    # The server ignored response_format and returned free text;
+                    # parse it as an act block so a non-enforcing server still limps.
+                    call = parse_tool_call(reply_text)
+
+            else:  # text: parse an `act` fence out of the prose reply.
+                try:
+                    reply_text = chat(self.cfg, messages, temperature=self.cfg.temperature)
                 except LLMError as e:
                     self.log(ui.bad(f"   ✖ model error: {e}"))
                     return False
-                reply = ActReply(content=text, tool_calls=[])
+                call = parse_tool_call(reply_text)
 
-            # Native path: run every tool_call the model emitted, threading a
-            # tool-role result back for each (the shape the native protocol wants).
-            if reply.tool_calls:
-                acted = True
-                messages.append(self._assistant_tool_msg(reply))
-                for tc in reply.tool_calls:
-                    call = self.registry.build_call(tc["name"], tc["arguments"])
-                    self._log_act(call)
-                    result = self.registry.dispatch(call, self.ctx)
-                    self._log_result(call, result)
-                    messages.append({"role": "tool", "tool_call_id": tc["id"],
-                                     "content": result})
-                continue
-
-            # Text path (fallback, and the only path in text mode): parse an `act`
-            # block out of the prose reply.
-            reply_text = reply.content
-            call = parse_tool_call(reply_text)
+            # Shared tail: run the one call, or handle a 'no action' reply.
             if call is None:
                 # No action. Normally that means the model considers the step done.
                 # But a weak model often DUMPS a file's content as a plain ```code```
@@ -499,10 +572,15 @@ class Harness:
         }
 
     def _nudge_text(self) -> str:
-        if self._native_tools:
+        if self._protocol == "native":
             return ("You called no tool, so NOTHING was saved. If you meant to create "
                     "or change a file, call the write_file tool. If the step is "
                     "genuinely complete, reply with a short plain sentence.")
+        if self._protocol == "json":
+            return ("You ran no tool, so NOTHING was saved. Reply with a single JSON "
+                    "object whose \"tool\" names the tool to run (e.g. write_file with "
+                    "\"path\" and \"content\"). If the step is genuinely complete, reply "
+                    "with {\"tool\": \"finish\"}.")
         return ("You produced no `act` block, so NOTHING was saved. If you meant to "
                 "create or change a file, you MUST use the write_file tool inside an "
                 "```act``` block — content shown in a plain code block is discarded. "
@@ -517,6 +595,19 @@ class Harness:
             "",
             checklist,
         ]
+        # List the files that already exist, so a later step REUSES a filename a
+        # previous step chose instead of inventing a new one for the same thing
+        # (backlog #8: the drift that left index.html linking a non-existent
+        # clean.svg while depfree.svg sat right there). Each fresh step starts in a
+        # blank context, so without this the model cannot know what it already wrote.
+        existing = self._project_files()
+        if existing:
+            parts += [
+                "",
+                "Files already in the project — when you refer to one of these, use its "
+                "EXACT path; don't invent a new name for a file that already exists "
+                "(e.g. link the icon that is here, not a differently-named one):",
+            ] + [f"- {p}" for p in existing]
         # Pin the exact file paths the Definition of Done checks, so the model uses
         # THESE names instead of inventing its own (styles.css vs style.css). Only
         # the mechanical exists/contains paths — never the judge criteria, which a
@@ -542,6 +633,32 @@ class Harness:
             ]
         parts += ["", "Begin. Read what you need, then make the change."]
         return "\n".join(parts)
+
+    # The workspace's own bookkeeping never counts as project files.
+    _LISTING_SKIP = {".git", ".achilles", "__pycache__", "node_modules",
+                     ".venv", ".pytest_cache"}
+
+    def _project_files(self, limit: int = 60) -> List[str]:
+        """The files that currently exist in the workspace, as workspace-relative
+        POSIX paths, for the 'files already in the project' hint. Reads the
+        filesystem (not git) so it is correct even with use_git off. Capped so a big
+        tree can't blow the prompt; the cap is generous for Achilles' small-project
+        target and, if hit, a final line says how many more there are."""
+        out: List[str] = []
+        extra = 0
+        for p in sorted(self.ws.rglob("*")):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(self.ws)
+            if any(part in self._LISTING_SKIP for part in rel.parts):
+                continue
+            if len(out) >= limit:
+                extra += 1
+                continue
+            out.append(rel.as_posix())
+        if extra:
+            out.append(f"… and {extra} more file(s)")
+        return out
 
     # ---- plan persistence (the externalised memory) -------------------
 

@@ -28,6 +28,14 @@ class LLMError(RuntimeError):
     pass
 
 
+def wants_constrained_json(config) -> bool:
+    """True when the run is on the constrained content-JSON protocol
+    (act_protocol="json"). The planner, the Definition of Done and the judge honour
+    the SAME switch as the act-loop, so one setting turns grammar-enforced structure
+    on everywhere a weak model would otherwise fumble the output format."""
+    return (getattr(config, "act_protocol", "native") or "").strip().lower() == "json"
+
+
 def _ask_keep_waiting(url: str, waited: int) -> bool:
     """The wait has crossed request_timeout. Ask whether to keep waiting (True) or
     abort (False), instead of the old behaviour of killing a still-healthy
@@ -179,6 +187,61 @@ class ActReply:
     content: str
     tool_calls: List[Dict]
     finish_reason: Optional[str] = None
+
+
+@dataclass
+class JsonReply:
+    """One constrained-content-JSON turn: the raw content string and, when it parsed
+    as a JSON object, the decoded dict. `obj` is None if the server ignored the
+    json_schema and returned something unparseable — the caller then degrades to
+    the text protocol on the SAME content instead of trusting a fragment."""
+    obj: Optional[dict]
+    content: str
+    finish_reason: Optional[str] = None
+
+
+def complete_json(config, messages: List[Dict], schema: Dict,
+                  temperature: float = 0.2, max_tokens: int | None = None,
+                  model: str | None = None) -> "JsonReply":
+    """Like chat(), but constrains the reply to `schema` on the CONTENT channel via
+    response_format=json_schema — the one channel LM Studio actually grammar-enforces
+    (its tool-call `arguments` channel is only a hint). No `tools` field is sent: the
+    act-call rides entirely in the content JSON. Returns the parsed object (or None if
+    the content wasn't valid JSON, so the caller can fall back)."""
+    if max_tokens is None:
+        max_tokens = getattr(config, "max_tokens", 0) or 0
+    payload = {
+        "model": model or config.model,
+        "messages": messages,
+        "temperature": temperature,
+        "stream": False,
+        "response_format": {"type": "json_schema",
+                            "json_schema": {"name": "act", "strict": True,
+                                            "schema": schema}},
+    }
+    if max_tokens and max_tokens > 0:
+        payload["max_tokens"] = max_tokens
+    body = _send(config, payload)
+
+    try:
+        choice = body["choices"][0]
+        content = choice["message"].get("content") or ""
+    except (KeyError, IndexError, TypeError) as e:
+        raise LLMError(f"Unexpected response shape: {json.dumps(body)[:500]}") from e
+
+    # A truncated JSON object is an unsafe fragment (same class as the text/tool
+    # paths): the closing brace or a whole "content" field can be cut off.
+    if choice.get("finish_reason") == "length":
+        raise _length_error(max_tokens)
+
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        obj = None
+    if not isinstance(obj, dict):
+        obj = None
+    return JsonReply(obj=obj, content=content,
+                     finish_reason=choice.get("finish_reason"))
 
 
 def complete_act(config, messages: List[Dict], tools: List[Dict],

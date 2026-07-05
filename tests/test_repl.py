@@ -56,7 +56,8 @@ def test_startup_resolves_model_before_showing_config(monkeypatch, capsys):
     # calls ensure_loaded (which adopts config.model) BEFORE _show_config.
     cfg = types.SimpleNamespace(
         model="local-model", base_url="http://localhost:1234/v1",
-        workspace_path="/ws", verify_command="", use_git=True, comfy_url="")
+        workspace_path="/ws", verify_command="", act_protocol="native",
+        use_git=True, comfy_url="")
 
     def _fake_ensure(config, log=print):
         config.model = "google/gemma-4-12b"       # adopt the loaded key

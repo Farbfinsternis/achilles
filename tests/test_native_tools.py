@@ -68,6 +68,38 @@ def test_native_write_roundtrip(tmp_path):
     assert res.startswith("OK")
 
 
+def test_write_file_rejects_empty_path(tmp_path):
+    # An empty path used to resolve to the workspace dir and fail with a cryptic
+    # "Permission denied", silently losing the step's work. Reject it cleanly.
+    r = _reg()
+    res = r.dispatch(r.build_call("write_file", {"path": "", "content": "x"}),
+                     ToolContext(tmp_path))
+    assert res.startswith("ERROR") and "path" in res.lower()
+
+
+def test_write_file_rejects_directory_path(tmp_path):
+    (tmp_path / "sub").mkdir()
+    r = _reg()
+    res = r.dispatch(r.build_call("write_file", {"path": "sub", "content": "x"}),
+                     ToolContext(tmp_path))
+    assert res.startswith("ERROR") and "directory" in res.lower()
+
+
+def test_write_file_hints_split_when_large(tmp_path):
+    # A large single file is the failure amplifier (read cap + judge budget); the
+    # write receipt nudges toward separate files, but its first line stays a clean OK.
+    r = _reg()
+    big = "\n".join(f"line {i}" for i in range(250))          # 250 lines
+    res = r.dispatch(r.build_call("write_file", {"path": "big.html", "content": big}),
+                     ToolContext(tmp_path))
+    assert res.startswith("OK: wrote")
+    assert "NOTE" in res and ".css" in res
+    # A small file gets no note.
+    res2 = r.dispatch(r.build_call("write_file", {"path": "s.txt", "content": "a\nb"}),
+                      ToolContext(tmp_path))
+    assert "NOTE" not in res2
+
+
 def test_describe_omits_usage_in_native_mode():
     d = _reg().describe(include_usage=False)
     assert "```act" not in d
@@ -151,7 +183,7 @@ def test_complete_act_length_with_calls_is_ok(monkeypatch):
 
 def _harness_cfg(tmp_path):
     return types.SimpleNamespace(
-        workspace_path=tmp_path, native_tools=True, tools=[], tools_dir="",
+        workspace_path=tmp_path, act_protocol="native", tools=[], tools_dir="",
         comfy_url="", max_acts_per_step=6, temperature=0.2, max_tokens=0)
 
 
@@ -168,7 +200,7 @@ def test_harness_native_executes_tool_calls(tmp_path, monkeypatch):
                             {"role": "user", "content": "u"}])
     assert ok is True
     assert (tmp_path / "foo.txt").read_text(encoding="utf-8") == "hi"
-    assert h._native_tools is True                 # never had to fall back
+    assert h._protocol == "native"                 # never had to fall back
 
 
 def test_harness_falls_back_to_text_protocol(tmp_path, monkeypatch):
@@ -181,7 +213,7 @@ def test_harness_falls_back_to_text_protocol(tmp_path, monkeypatch):
     ok = h._act_until_done([{"role": "system", "content": "s"},
                             {"role": "user", "content": "u"}])
     assert ok is True
-    assert h._native_tools is False                # flipped off for the run
+    assert h._protocol == "text"                   # degraded for the run
 
 
 def test_work_prompt_pins_dod_paths(tmp_path):
@@ -200,6 +232,36 @@ def test_work_prompt_omits_block_when_no_paths(tmp_path):
     h._expected_paths = []
     prompt = h._work_prompt("build it", [{"done": False, "text": "x"}], last_verify=None)
     assert "Required file paths" not in prompt
+
+
+def test_work_prompt_lists_existing_files(tmp_path):
+    # backlog #8: each fresh step is told which files already exist, so a later step
+    # reuses a filename instead of inventing a drifted one (clean.svg vs depfree.svg).
+    (tmp_path / "index.html").write_text("x", encoding="utf-8")
+    (tmp_path / "styles").mkdir()
+    (tmp_path / "styles" / "styles.css").write_text("y", encoding="utf-8")
+    (tmp_path / ".achilles").mkdir()
+    (tmp_path / ".achilles" / "plan.md").write_text("z", encoding="utf-8")
+    h = H.Harness(_harness_cfg(tmp_path), log=lambda *_: None)
+    prompt = h._work_prompt("do it", [{"done": False, "text": "t"}], last_verify=None)
+    assert "Files already in the project" in prompt
+    assert "index.html" in prompt and "styles/styles.css" in prompt
+    assert ".achilles/plan.md" not in prompt        # workspace bookkeeping is skipped
+
+
+def test_work_prompt_omits_existing_block_when_empty(tmp_path):
+    h = H.Harness(_harness_cfg(tmp_path), log=lambda *_: None)
+    prompt = h._work_prompt("x", [{"done": False, "text": "t"}], last_verify=None)
+    assert "Files already in the project" not in prompt
+
+
+def test_project_files_caps_and_counts(tmp_path):
+    for i in range(6):
+        (tmp_path / f"f{i}.txt").write_text("x", encoding="utf-8")
+    h = H.Harness(_harness_cfg(tmp_path), log=lambda *_: None)
+    lst = h._project_files(limit=3)
+    assert len([x for x in lst if not x.startswith("…")]) == 3
+    assert any("more file" in x for x in lst)
 
 
 def test_log_result_prints_receipts(tmp_path):
@@ -236,8 +298,18 @@ def test_system_prompt_permits_cdn_and_google_fonts(tmp_path):
     # The CDN/font permission must reach BOTH protocol variants — a web-capable
     # model shouldn't be stuck vendoring Tailwind or a font it could just link.
     h = H.Harness(_harness_cfg(tmp_path), log=lambda *_: None)
-    for native in (True, False):
-        h._native_tools = native
+    for proto in ("native", "json", "text"):
+        h._protocol = proto
         prompt = h._system_prompt()
         assert "cdn.tailwindcss.com" in prompt
         assert "fonts.googleapis.com" in prompt
+
+
+def test_system_prompt_steers_to_small_files(tmp_path):
+    # The keep-files-small policy (backlog #14) must reach every act protocol.
+    h = H.Harness(_harness_cfg(tmp_path), log=lambda *_: None)
+    for proto in ("native", "json", "text"):
+        h._protocol = proto
+        prompt = h._system_prompt()
+        assert ".css" in prompt and ".js" in prompt
+        assert "small" in prompt.lower()

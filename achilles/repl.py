@@ -170,6 +170,7 @@ class Repl:
         row("base_url", c.base_url)
         row("workspace", c.workspace_path)
         row("verify_command", c.verify_command or ui.warn("(none — flying blind)"))
+        row("act_protocol", c.act_protocol)
         row("use_git", c.use_git)
         if c.comfy_url:
             default = self._store().get_default()

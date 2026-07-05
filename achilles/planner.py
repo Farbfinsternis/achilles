@@ -16,7 +16,23 @@ reason dumb code can drive a smart model.
 import re
 from typing import List
 
-from .llm import chat
+from .llm import chat, complete_json, wants_constrained_json, LLMError
+
+
+# The constrained-decoding shape for a plan: a JSON object with a `steps` array of
+# strings. On act_protocol="json" the server grammar-forces the reply into this,
+# so a weak model cannot bury the checklist in prose or truncate it mid-list.
+PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {"steps": {"type": "array", "items": {"type": "string"}}},
+    "required": ["steps"],
+    "additionalProperties": False,
+}
+
+# Appended in json mode so the task instruction and the enforced output shape agree
+# (the OUTPUT FORMAT text stanza describes the text protocol's checklist).
+PLAN_JSON_NOTE = ("\n\nReturn ONLY a JSON object of the form "
+                  '{"steps": ["first step", "second step", ...]}.')
 
 
 PLAN_SYSTEM = """You are a planning assistant for a coding agent that works in SMALL, verifiable steps.
@@ -24,6 +40,10 @@ PLAN_SYSTEM = """You are a planning assistant for a coding agent that works in S
 Turn the user's request into a checklist. Rules for a GOOD plan:
 - Each step is small enough to implement and TEST on its own.
 - Order steps so that earlier ones can be verified before later ones depend on them.
+- Prefer MANY SMALL, focused files over one big one. For a web page, plan SEPARATE
+  files — index.html, styles.css, script.js — linked together, rather than inlining
+  all CSS and JS into the HTML; give each file its own step. Small files stay easy to
+  edit correctly in one step.
 - The LAST step is always to run the project's tests / build to confirm the whole thing works.
 - Prefer 3-8 steps. Do not pad.
 
@@ -80,14 +100,51 @@ def parse_checklist(text: str) -> List[str]:
     return steps
 
 
+def _coerce_steps(items) -> List[str]:
+    """Clean the strings from a constrained `steps` array: strip any leftover
+    checkbox/bullet/number prefix the model tucked in, drop empties and the
+    non-step bullets parse_checklist also filters."""
+    out: List[str] = []
+    for it in items or []:
+        s = str(it).strip()
+        for rx in _STEP_RES:                 # peel a stray "- [ ] " / "1. " / "- "
+            m = rx.match(s)
+            if m:
+                s = m.group(1).strip()
+                break
+        if s and not s.lower().startswith(("here", "plan:", "note")):
+            out.append(s)
+    return out
+
+
+def _plan_via_json(config, messages) -> List[str] | None:
+    """Constrained path shared by make_plan/revise_plan. Returns the steps when the
+    server honoured the schema, [] parsed from prose when it ignored it, or None so
+    the caller falls back to free chat() (server rejected response_format)."""
+    if not wants_constrained_json(config):
+        return None
+    try:
+        jr = complete_json(config, messages, PLAN_SCHEMA, temperature=config.temperature)
+    except LLMError:
+        return None                          # e.g. response_format unsupported → fall back
+    if jr.obj is not None:
+        return _coerce_steps(jr.obj.get("steps"))
+    return parse_checklist(jr.content)       # schema ignored: parse the text we got
+
+
 def make_plan(config, goal: str, tree: str) -> List[str]:
     system = PLAN_SYSTEM
     if getattr(config, "comfy_url", ""):
         system += IMAGE_PLAN_NUDGE
+    if wants_constrained_json(config):
+        system += PLAN_JSON_NOTE
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": PLAN_USER_TEMPLATE.format(tree=tree, goal=goal)},
     ]
+    steps = _plan_via_json(config, messages)
+    if steps is not None:
+        return steps
     # No hard token cap here: reasoning models spend tokens on thinking before
     # the checklist, so a fixed cap (1024) truncated them mid-plan. Fall back to
     # config.max_tokens (0 = use the model's own context window).
@@ -136,11 +193,16 @@ def revise_plan(config, goal: str, steps: List[str], instruction: str,
     system = REVISE_SYSTEM
     if getattr(config, "comfy_url", ""):
         system += IMAGE_PLAN_NUDGE
+    if wants_constrained_json(config):
+        system += PLAN_JSON_NOTE
     current = "\n".join(f"- [ ] {s}" for s in steps)
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": REVISE_USER_TEMPLATE.format(
             tree=tree, goal=goal, plan=current, instruction=instruction)},
     ]
+    revised = _plan_via_json(config, messages)
+    if revised is not None:
+        return revised
     reply = chat(config, messages, temperature=config.temperature)
     return parse_checklist(reply)

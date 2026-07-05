@@ -56,13 +56,16 @@ temperature = 0.2
 # with a larger context in LM Studio.
 max_tokens = 0
 
-# Native (OpenAI) tool-calling. On by default: Achilles sends the tools as a JSON
-# schema and reads structured tool_calls back — tool-tuned models (even small 4B
-# ones) use their hands far more reliably this way than with the text `act` format
-# they were never trained on. Automatic fallback: if the server rejects the tools
-# field or the model replies in prose, the text `act` protocol is parsed instead.
-# Set to false to force the text protocol (e.g. a server that mishandles tools).
-native_tools = true
+# How the model drives its tools:
+#   "native" — OpenAI tool-calling: tools go out as a JSON schema, structured
+#              tool_calls come back. Best for tool-tuned models.
+#   "json"   — constrained content-JSON: the model emits ONE JSON object per turn
+#              and the server grammar-enforces its shape (response_format=json_schema).
+#              The reliable path for a weak 4B on LM Studio, whose tool-call arguments
+#              channel is NOT grammar-constrained even though the content channel IS.
+#   "text"   — the fenced ```act``` protocol; the universal fallback.
+# Any choice degrades to "text" mid-run if the server rejects the richer request.
+act_protocol = "native"
 
 # --- the tool registry (the model's hands, extensible) ---
 # The model always has the four built-in tools (read_file, write_file, list_dir,

@@ -30,6 +30,12 @@ from .protocol import ToolCall
 # Cap any single tool result so one noisy command can't blow the context window.
 MAX_OUTPUT_CHARS = 8000
 
+# Above this many lines, write_file appends a gentle split-it-up hint (backlog #14).
+# A big file overflows read_file's cap (whole-file rewrites then lose the tail) and
+# the judge's per-file budget (true criteria FAIL unseen), so we nudge toward
+# separate files while the context is still warm.
+_LARGE_FILE_LINES = 200
+
 
 def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     if len(text) <= limit:
@@ -115,12 +121,27 @@ def _read_file(args, body, ctx: ToolContext) -> str:
 
 
 def _write_file(args, body, ctx: ToolContext) -> str:
-    path = args.get("path", "")
+    # An empty path resolves to the workspace root, whose write_text then fails with
+    # a cryptic "Permission denied" on the directory. Reject it up front with an
+    # actionable message so the model retries with a real path in the SAME step,
+    # instead of losing the step's work to a swallowed directory-write error.
+    path = (args.get("path") or "").strip()
+    if not path:
+        return "ERROR: write_file needs a non-empty 'path' (with the file body in 'content')."
     p = ctx.resolve(path)
+    if p.is_dir():
+        return f"ERROR: '{path}' is a directory, not a file — give a file path."
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(body or "", encoding="utf-8")
     n = (body or "").count("\n") + 1
-    return f"OK: wrote {path} ({n} lines)"
+    ok = f"OK: wrote {path} ({n} lines)"
+    if n > _LARGE_FILE_LINES:
+        # A second line, so the receipt's first line stays a clean green "OK".
+        ok += ("\nNOTE: this file is large. If it mixes separable concerns (e.g. an "
+               "HTML page with inline CSS and JS), splitting the CSS into a .css file "
+               "and the JS into a .js file — linked from the HTML — keeps each file "
+               "small and easier to edit correctly next time.")
+    return ok
 
 
 def _list_dir(args, body, ctx: ToolContext) -> str:
@@ -249,6 +270,25 @@ class Registry:
                                      "description": t.description,
                                      "parameters": params}})
         return out
+
+    def content_json_schema(self) -> dict:
+        """The act-loop's constrained-decoding schema, for act_protocol="json": a
+        single FLAT object whose `tool` enum is the act tools plus the "finish"
+        sentinel (how a grammar-forced reply signals "step done"), with every tool's
+        argument fields as optional strings. A weak model's reply is grammar-forced
+        into this shape on the content channel — the channel LM Studio actually
+        enforces. Flat + only `tool` required is deliberate: it survives strict mode
+        and needs no per-tool oneOf grammar (both verified against LM Studio)."""
+        tools = [t for t in self._tools.values() if t.act]
+        props: dict = {"tool": {"type": "string",
+                                "enum": [t.name for t in tools] + ["finish"]}}
+        for t in tools:
+            for field in ((t.parameters or {}).get("properties") or {}):
+                props.setdefault(field, {"type": "string"})
+            if t.body_param:
+                props.setdefault(t.body_param, {"type": "string"})
+        return {"type": "object", "properties": props,
+                "required": ["tool"], "additionalProperties": False}
 
     def describe(self, include_usage: bool = True) -> str:
         """Render the tool list for the model's system prompt — this is how a new

@@ -179,3 +179,49 @@ def test_gather_context_summarises_omitted_files(tmp_path):
     # One summary note, not the old unbounded per-file marker lines.
     assert "more text file(s) omitted" in out
     assert "(omitted — context budget reached)" not in out
+
+
+def test_gather_context_includes_priority_file_whole(tmp_path):
+    # A contract-referenced file (one big self-contained page) must be shown WHOLE,
+    # while an incidental file still respects the small per-file cap. Otherwise the
+    # judge FAILs criteria whose evidence lives past the per-file cut.
+    (tmp_path / "index.html").write_text("A" * 10000, encoding="utf-8")
+    (tmp_path / "other.py").write_text("B" * 10000, encoding="utf-8")
+    out = _gather_context(_Ctx(tmp_path), per_file=2000, total=40000,
+                          priority=["index.html"])
+    assert "A" * 10000 in out                    # priority file untrimmed
+    assert "B" * 2001 not in out                 # incidental file trimmed at per_file
+    assert "chars trimmed" in out                # …and marked as trimmed
+
+
+def test_judge_forwards_priority_to_context(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_gather(ctx, per_file, total, priority=()):
+        captured["priority"] = list(priority)
+        return "FILES"
+    monkeypatch.setattr(acceptance, "_gather_context", fake_gather)
+    monkeypatch.setattr(acceptance, "chat", lambda *a, **k: "1: PASS - ok")
+    _judge(_JudgeCfg(), [Criterion("judge", "x")], _Ctx(tmp_path),
+           lambda *a, **k: None, priority=["index.html"])
+    assert captured["priority"] == ["index.html"]
+
+
+def test_check_uses_expected_paths_as_judge_priority(monkeypatch, tmp_path):
+    # check() must hand the contract's exists/contains paths to the judge as
+    # priority, so the judged file is shown whole.
+    from achilles.tools import Registry, BUILTINS, ToolContext as TC
+    (tmp_path / "index.html").write_text("hello world", encoding="utf-8")
+    reg = Registry()
+    for t in BUILTINS:
+        reg.register(t)
+    seen = {}
+
+    def fake_judge(config, items, ctx, log, priority=()):
+        seen["priority"] = list(priority)
+        return [(True, "ok") for _ in items]
+    monkeypatch.setattr(acceptance, "_judge", fake_judge)
+    criteria = [Criterion("contains", "index.html :: hello"),
+                Criterion("judge", "looks good")]
+    acceptance.check(_JudgeCfg(), criteria, reg, TC(tmp_path), lambda *a, **k: None)
+    assert seen["priority"] == ["index.html"]

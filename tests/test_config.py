@@ -34,6 +34,20 @@ def test_env_bad_int_is_reported(monkeypatch, tmp_path):
         load_config(str(tmp_path))
 
 
+def test_legacy_native_tools_maps_to_act_protocol(tmp_path):
+    # A pre-migration config used native_tools (bool); it must still be meaningful —
+    # native_tools=false meant the text protocol.
+    (tmp_path / "achilles.toml").write_text("native_tools = false\n", encoding="utf-8")
+    cfg = load_config(str(tmp_path))
+    assert cfg.act_protocol == "text"
+    assert not hasattr(cfg, "native_tools")        # the field is gone, only the shim
+
+
+def test_act_protocol_default_is_native(tmp_path):
+    (tmp_path / "achilles.toml").write_text("", encoding="utf-8")
+    assert load_config(str(tmp_path)).act_protocol == "native"
+
+
 def test_coerce_env_bool_forms():
     assert _coerce_env(True, "no") is False
     assert _coerce_env(False, "ON") is True

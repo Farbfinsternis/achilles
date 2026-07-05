@@ -41,7 +41,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .llm import chat, LLMError
+from .llm import chat, complete_json, wants_constrained_json, LLMError
 from .protocol import ToolCall
 from . import style as ui
 
@@ -90,6 +90,13 @@ X" belongs to judge:, never to contains:. If you cannot name the exact string,
 use judge:. Also mind WHICH file holds the text: styling checks target the CSS
 file, not the HTML, if the CSS is external.
 
+Write the BARE substring — do NOT wrap <text> in quotation marks, and keep it SHORT
+(a tag, a class, a few words). Quotes and long sentences are fragile: the check is
+byte-exact, so surrounding quotes would have to appear literally too, and one
+different character (a curly quote, an em-dash) fails a long quote.
+  BAD:   - [ ] contains: index.html :: "Build the Future"   (the quotes aren't in the file)
+  GOOD:  - [ ] contains: index.html :: Build the Future
+
 Rules:
 - Prefer exists/contains over judge for ANYTHING mechanical. The HARNESS performs
   these itself — you only NAME a path or a substring. NEVER write shell commands,
@@ -123,10 +130,30 @@ User request:
 Write the Definition of Done now."""
 
 
+# The constrained shape for the Definition of Done: a JSON object with a `criteria`
+# array of STRINGS, each string one criterion line in the existing text format
+# ("exists: path", "contains: path :: text", "judge: quality"). Keeping the line
+# format (rather than structured {kind,text} fields) lets parse_acceptance and its
+# repair logic stay in charge; the schema only guarantees a clean, prose-free list.
+ACCEPT_SCHEMA = {
+    "type": "object",
+    "properties": {"criteria": {"type": "array", "items": {"type": "string"}}},
+    "required": ["criteria"],
+    "additionalProperties": False,
+}
+ACCEPT_JSON_NOTE = ('\n\nReturn ONLY a JSON object of the form {"criteria": '
+                    '["exists: path", "contains: path :: literal text", '
+                    '"judge: a quality"]}. Each array item is exactly ONE criterion '
+                    "line in the format described above (keep the leading kind tag).")
+
+
 _TAGGED = re.compile(
     r"^\s*[-*]\s*(?:\[[ xX]?\]\s*)?(exists|absent|contains|run|cmd|check|judge)\b\s*:?\s*(.+?)\s*$",
     re.I)
 _BULLET = re.compile(r"^\s*[-*]\s*(?:\[[ xX]?\]\s*)?(.+?)\s*$")
+# A leading bullet + optional checkbox, stripped from a constrained `criteria`
+# array item before re-adding a single canonical one (see _acceptance_via_json).
+_LEAD_BULLET = re.compile(r"^\s*[-*]\s*(?:\[[ xX]?\]\s*)?")
 
 
 def _normalise(kind: str, text: str) -> Criterion:
@@ -177,21 +204,49 @@ def render_acceptance(goal: str, criteria: list[Criterion]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _acceptance_via_json(config, messages) -> list[Criterion] | None:
+    """Constrained path: return the parsed criteria when act_protocol="json" and the
+    server honoured (or ignored) the schema, or None so make_acceptance falls back to
+    free chat() (server rejected response_format). The `criteria` strings still flow
+    through parse_acceptance, so all its repair logic applies either way."""
+    if not wants_constrained_json(config):
+        return None
+    try:
+        jr = complete_json(config, messages, ACCEPT_SCHEMA, temperature=config.temperature)
+    except LLMError:
+        return None
+    if jr.obj is not None:
+        # Give parse_acceptance the exact bullet it expects: strip whatever leading
+        # bullet/checkbox the model did or didn't include (its examples show "- [ ]",
+        # so it often adds one), then prefix a single canonical "- [ ]". Without the
+        # strip, a model-supplied prefix doubles up ("- [ ] - [ ] exists: …") and the
+        # kind tag is lost — the criterion mis-parses as a judge line.
+        lines = "\n".join(f"- [ ] {_LEAD_BULLET.sub('', str(x).strip())}"
+                          for x in (jr.obj.get("criteria") or []))
+        return parse_acceptance(lines)
+    return parse_acceptance(jr.content)      # schema ignored: parse the text we got
+
+
 def make_acceptance(config, goal: str, tree: str) -> list[Criterion]:
     system = ACCEPT_SYSTEM
     if getattr(config, "comfy_url", ""):
         system += IMAGE_ACCEPT_NUDGE
+    if wants_constrained_json(config):
+        system += ACCEPT_JSON_NOTE
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": ACCEPT_USER_TEMPLATE.format(tree=tree, goal=goal)},
     ]
-    # No hard token cap: reasoning models spend tokens thinking before the list,
-    # so a fixed cap truncated them. Falls back to config.max_tokens (0 = uncapped).
-    reply = chat(config, messages, temperature=config.temperature)
+    criteria = _acceptance_via_json(config, messages)
+    if criteria is None:
+        # No hard token cap: reasoning models spend tokens thinking before the list,
+        # so a fixed cap truncated them. Falls back to config.max_tokens (0 = uncapped).
+        reply = chat(config, messages, temperature=config.temperature)
+        criteria = parse_acceptance(reply)
     # The model must never author an executable command or a raw tool-call — it
     # cannot do it reliably. Keep only the kinds the HARNESS checks robustly;
     # run:/check: survive only in a HUMAN-written done.md.
-    return [c for c in parse_acceptance(reply)
+    return [c for c in criteria
             if c.kind in ("exists", "contains", "absent", "judge")]
 
 
@@ -216,7 +271,11 @@ def check(config, criteria: list[Criterion], registry, ctx, log) -> list[Failure
             failures.append(Failure(c, reason))
 
     if judge_items:
-        for c, (ok, reason) in zip(judge_items, _judge(config, judge_items, ctx, log)):
+        # The files the contract names (exists/contains) are the ones the judge most
+        # likely reasons about ("the page …") — hand them to the judge WHOLE so a
+        # large single-file page isn't trimmed out from under a true criterion.
+        priority = expected_paths(criteria)
+        for c, (ok, reason) in zip(judge_items, _judge(config, judge_items, ctx, log, priority)):
             mark = ui.ok("✔") if ok else ui.bad("✖")
             log(f"   {mark} " + ui.accent("[judge]") + f" {c.text}")
             if not ok:
@@ -322,6 +381,24 @@ Output EXACTLY one line per criterion, in order, nothing else:
 <n>: FAIL — <what is missing>"""
 
 
+# The constrained shape for the judge: a `verdicts` array, one object per criterion
+# IN ORDER, each a boolean pass + a reason. On act_protocol="json" this replaces the
+# brittle "<n>: PASS/FAIL — ..." line parsing with a grammar-enforced structure.
+JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {"verdicts": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"pass": {"type": "boolean"}, "reason": {"type": "string"}},
+        "required": ["pass", "reason"], "additionalProperties": False}}},
+    "required": ["verdicts"],
+    "additionalProperties": False,
+}
+JUDGE_JSON_NOTE = ('\n\nReturn ONLY a JSON object of the form {"verdicts": '
+                   '[{"pass": true, "reason": "file: quoted evidence"}, ...]}, with '
+                   "one entry per criterion IN ORDER. pass=false when you cannot cite "
+                   "evidence.")
+
+
 # "1: PASS — ...", "2) FAIL: ...", "3. pass - ..." etc.
 _VERDICT = re.compile(r"^\s*\(?(\d+)\)?\s*[:.\)\-]\s*(PASS|FAIL)\b[\s:．。\-–—]*(.*)$", re.I)
 
@@ -340,22 +417,53 @@ def _parse_verdicts(reply: str, n: int) -> list[tuple[bool, str]]:
             for i in range(1, n + 1)]
 
 
-def _judge(config, items: list[Criterion], ctx, log) -> list[tuple[bool, str]]:
+def _coerce_verdicts(verdicts, n: int) -> list[tuple[bool, str]]:
+    """Map the constrained `verdicts` array onto (pass, reason) tuples, aligned to
+    the n criteria by position. A short list (a missing verdict) FAILs the rest —
+    the same strictness as the regex path's default."""
+    out: list[tuple[bool, str]] = []
+    for v in (verdicts or [])[:n]:
+        ok = bool(v.get("pass")) if isinstance(v, dict) else False
+        reason = ((v.get("reason") if isinstance(v, dict) else "") or "").strip()
+        out.append((ok, reason or ("ok" if ok else "no reason given")))
+    while len(out) < n:
+        out.append((False, "the judge returned no verdict for this criterion"))
+    return out
+
+
+def _judge(config, items: list[Criterion], ctx, log,
+           priority=()) -> list[tuple[bool, str]]:
     bundle = _gather_context(ctx,
                             per_file=getattr(config, "judge_char_per_file", 6000),
-                            total=getattr(config, "judge_char_budget", 24000))
+                            total=getattr(config, "judge_char_budget", 24000),
+                            priority=priority)
     numbered = "\n".join(f"{i}. {c.text}" for i, c in enumerate(items, 1))
+    system = JUDGE_SYSTEM + (JUDGE_JSON_NOTE if wants_constrained_json(config) else "")
     messages = [
-        {"role": "system", "content": JUDGE_SYSTEM},
+        {"role": "system", "content": system},
         {"role": "user", "content":
             f"SUBMITTED FILES:\n\n{bundle}\n\nCRITERIA:\n{numbered}\n\nReview now."},
     ]
+    # Constrained path first (act_protocol="json"): a grammar-enforced verdicts array
+    # instead of line parsing. An LLMError here is NOT fatal — the server may just
+    # not support response_format — so we fall through to the text judge, which
+    # preserves the "judge server down → HALT" contract on a real outage.
+    judge_model = config.judge_model or None
+    if wants_constrained_json(config):
+        try:
+            jr = complete_json(config, messages, JUDGE_SCHEMA, temperature=0.0,
+                               model=judge_model)
+        except LLMError:
+            jr = None
+        if jr is not None:
+            if jr.obj is not None:
+                return _coerce_verdicts(jr.obj.get("verdicts"), len(items))
+            return _parse_verdicts(jr.content, len(items))   # schema ignored
     try:
         # temperature 0 — judging should be as deterministic as the model allows.
         # No hard token cap: reasoning judge models need room to think before the
         # verdict. Falls back to config.max_tokens (0 = uncapped).
-        reply = chat(config, messages, temperature=0.0,
-                     model=config.judge_model or None)
+        reply = chat(config, messages, temperature=0.0, model=judge_model)
     except LLMError as e:
         # NOT a content FAIL — the judge server is down/unreachable. Signal the
         # harness to halt instead of marking every criterion unmet (Bug 11).
@@ -369,19 +477,26 @@ _TEXT_SUFFIXES = {".html", ".htm", ".css", ".js", ".ts", ".jsx", ".tsx", ".py",
                   ".json", ".md", ".txt", ".toml", ".yml", ".yaml", ".svg", ".cfg"}
 
 
-def _gather_context(ctx, per_file: int = 6000, total: int = 24000) -> str:
+def _gather_context(ctx, per_file: int = 6000, total: int = 24000,
+                    priority=()) -> str:
     """Bundle the workspace's text files for the judge. v1 reads everything that
     fits the budget; large projects will want the repo-map retrieval that is on
     the wishlist — the judge would then see only the relevant slice.
+
+    `priority` names the files the CONTRACT explicitly checks (the exists/contains
+    paths). Those go FIRST and are included WHOLE (up to the total budget, not the
+    small per-file cap) — otherwise a single self-contained page (one 18k-char
+    index.html) gets trimmed to per_file and the judge FAILs criteria whose evidence
+    lives past the cut, even though the file satisfies them. Other files keep the
+    per-file trim so one big incidental file can't eat the budget.
 
     Files that don't fit are counted once at the end, not appended as per-file
     marker lines (those used to grow unbounded, ironically eating the very budget
     they reported). A trimmed/omitted file means the judge may lack evidence, so
     the budget should be generous enough that this stays rare (Bug 7)."""
     root: Path = ctx.ws
-    chunks: list[str] = []
-    used = 0
-    omitted = 0
+    prio = {str(p).strip().replace("\\", "/") for p in (priority or []) if str(p).strip()}
+    candidates = []
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
@@ -390,14 +505,23 @@ def _gather_context(ctx, per_file: int = 6000, total: int = 24000) -> str:
             continue
         if path.suffix.lower() not in _TEXT_SUFFIXES:
             continue
+        candidates.append((rel.as_posix(), path))
+    # Contract-referenced files first (whole), then the rest (per-file trim).
+    candidates.sort(key=lambda rp: (rp[0] not in prio, rp[0]))
+
+    chunks: list[str] = []
+    used = 0
+    omitted = 0
+    for rel, path in candidates:
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-        snippet = text[:per_file]
-        if len(text) > per_file:
-            snippet += f"\n... [{len(text) - per_file} chars trimmed] ..."
-        block = f"=== {rel.as_posix()} ===\n{snippet}\n"
+        cap = total if rel in prio else per_file      # priority files untrimmed
+        snippet = text[:cap]
+        if len(text) > cap:
+            snippet += f"\n... [{len(text) - cap} chars trimmed] ..."
+        block = f"=== {rel} ===\n{snippet}\n"
         if used + len(block) > total:
             omitted += 1
             continue
