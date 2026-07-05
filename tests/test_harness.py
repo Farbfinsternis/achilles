@@ -61,3 +61,52 @@ def test_second_step_outage_keeps_first_done(tmp_path, monkeypatch):
     assert ok is False
     assert plan[0]["done"] is True             # real progress is preserved
     assert plan[1]["done"] is False            # the outage step stays open
+
+
+# ---- acceptance non-convergence guard -------------------------------------
+
+def _accept_harness(tmp_path, monkeypatch, rounds=5):
+    cfg = Config(workspace=str(tmp_path), use_git=False, verify_command="",
+                 max_accept_rounds=rounds)
+    h = Harness(cfg, log=lambda *a, **k: None)
+    h.state_dir.mkdir(exist_ok=True)
+    monkeypatch.setattr(h, "_commit", lambda *a, **k: None)
+    return h
+
+
+def test_acceptance_halts_on_non_convergence(tmp_path, monkeypatch):
+    # The same criterion failing two rounds in a row (a fix that moved nothing) must
+    # HALT early with a pointer, not churn silently to the round cap.
+    from achilles import acceptance as A
+    from achilles.acceptance import Criterion, Failure
+    h = _accept_harness(tmp_path, monkeypatch, rounds=5)
+    crit = Criterion("contains", "index.html :: PLAN -> ACT -> VERIFY")
+    checks = {"n": 0}
+    works = {"n": 0}
+    monkeypatch.setattr(A, "check",
+                        lambda *a, **k: (checks.__setitem__("n", checks["n"] + 1),
+                                         [Failure(crit, "not found")])[1])
+    monkeypatch.setattr(h, "_work",
+                        lambda *a, **k: works.__setitem__("n", works["n"] + 1) or True)
+
+    ok = h._acceptance_phase("goal", [{"done": True, "text": "t"}], [crit], None)
+
+    assert ok is False
+    assert checks["n"] == 2          # round 1 (check+fix), round 2 check → same → halt
+    assert works["n"] == 1           # only one fix, not five rounds of churn
+
+
+def test_acceptance_continues_when_making_progress(tmp_path, monkeypatch):
+    # Shrinking failures (real progress) must NOT trip the guard — it runs until met.
+    from achilles import acceptance as A
+    from achilles.acceptance import Criterion, Failure
+    h = _accept_harness(tmp_path, monkeypatch, rounds=5)
+    monkeypatch.setattr(h, "_work", lambda *a, **k: True)
+    a = Failure(Criterion("contains", "x :: A"), "no")
+    b = Failure(Criterion("contains", "x :: B"), "no")
+    seq = iter([[a, b], [b], []])                 # two, then one, then met
+    monkeypatch.setattr(A, "check", lambda *a, **k: next(seq))
+
+    ok = h._acceptance_phase("goal", [{"done": True, "text": "t"}], [], None)
+
+    assert ok is True                             # progressed each round, then met

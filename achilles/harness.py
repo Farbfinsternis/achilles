@@ -341,6 +341,7 @@ class Harness:
         This is where a small model is pushed past "nothing crashed" toward the
         actual goal — and where we keep the floor green after each fix."""
         from .acceptance import check, JudgeUnavailable
+        prev_sig = None
         for rnd in range(1, self.cfg.max_accept_rounds + 1):
             self.log("\n" + ui.head(f"ACCEPT {rnd}/{self.cfg.max_accept_rounds}", color="magenta")
                      + " " + ui.muted("(checking the Definition of Done)"))
@@ -354,6 +355,16 @@ class Harness:
             if not failures:
                 self.log("\n" + ui.ok("✔  Definition of Done met — task complete."))
                 return True
+            # Non-convergence guard: if the previous fix left the EXACT same criteria
+            # unmet, another round just rewrites the same thing (a weak model
+            # regenerates rather than repairs, and a byte-exact contains can be
+            # unsatisfiable by a good implementation). Halt now and name the culprit
+            # instead of churning silently to the round cap.
+            sig = self._failure_signature(failures)
+            if sig == prev_sig:
+                self._report_stuck(failures)
+                return False
+            prev_sig = sig
             self.log(ui.warn(f"   {len(failures)} criterion(s) unmet") + ui.muted(" — sending a targeted fix."))
             unmet = "\n".join(f"- {f.criterion.text}  (problem: {f.reason})" for f in failures)
             instruction = ("The work is NOT done. The following acceptance criteria are not "
@@ -384,6 +395,25 @@ class Harness:
         for f in failures:
             self.log("   " + ui.bad("-") + f" {f.criterion.text}  " + ui.muted(f"({f.reason})"))
         return False
+
+    @staticmethod
+    def _failure_signature(failures) -> frozenset:
+        """The SET of still-failing criteria, keyed by kind+text (the reason wording
+        is ignored — the judge may phrase it differently run to run). Two consecutive
+        rounds with the same signature mean the last fix moved nothing."""
+        return frozenset((f.criterion.kind, f.criterion.text) for f in failures)
+
+    def _report_stuck(self, failures) -> None:
+        """Halt message for non-convergence: name the criteria that stayed unmet and
+        point the human at the one lever that actually helps — editing the contract."""
+        self.log(ui.bad("\n✖  Halted: no progress — the same criterion(s) stayed unmet after "
+                        "a fix round.") + "\n"
+                 + ui.muted("   More rounds would just rewrite the same thing. Likely "
+                            "unsatisfiable or too strict:"))
+        for f in failures:
+            self.log("   " + ui.bad("-") + f" {f.criterion.text}  " + ui.muted(f"({f.reason})"))
+        self.log(ui.muted("   Edit .achilles/done.md to relax or fix the stuck criterion "
+                          "(e.g. turn a byte-exact contains: into a judge:), then re-run to resume."))
 
     def _verify(self):
         """Run the oracle. Returns (passed, output). No oracle -> (True, None)."""
