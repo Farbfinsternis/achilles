@@ -260,6 +260,12 @@ class Harness:
         tasks. (2) The FLOOR: a real oracle must be green. (3) The CEILING: the
         Definition of Done, judged and fix-looped until met. Absent a DoD, the
         floor (or a finished plan) is the whole story — the configured fallback."""
+        # Pin the ORIGINAL request so every fresh step sees the source of truth for
+        # CONTENT (names, copy, facts). The planner compresses the goal into
+        # structural step texts and the facts drop out; without the goal here the
+        # executor fills the structure from its own prior (a generic "AICode" SaaS
+        # page instead of ACHILLES). This is the content analog of _expected_paths.
+        self._goal = goal
         # Load the Definition of Done FIRST and pin its required file paths, so the
         # executor names files to match the contract from step one — not after an
         # acceptance round finds "styles.css" missing because it wrote "style.css".
@@ -625,6 +631,21 @@ class Harness:
             "",
             checklist,
         ]
+        # Pin the original request as the source of truth for CONTENT. The plan is
+        # structure; the facts, names, copy and exact wording live only here. Use
+        # THIS material — don't invent a product name or generic filler (backlog #8's
+        # sibling for content, not filenames).
+        goal = getattr(self, "_goal", "")
+        if goal:
+            parts += [
+                "",
+                "ORIGINAL REQUEST — the source of truth for all CONTENT (the project's "
+                "name, the facts, the copy, the exact wording and headings). Put THIS "
+                "material on the page verbatim where it fits; do NOT invent a different "
+                "product name or generic marketing filler:",
+                "",
+                goal,
+            ]
         # List the files that already exist, so a later step REUSES a filename a
         # previous step chose instead of inventing a new one for the same thing
         # (backlog #8: the drift that left index.html linking a non-existent

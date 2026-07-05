@@ -234,6 +234,22 @@ def test_work_prompt_omits_block_when_no_paths(tmp_path):
     assert "Required file paths" not in prompt
 
 
+def test_work_prompt_includes_original_goal(tmp_path):
+    # The executor must see the goal's CONTENT (facts, names) — not just the
+    # structural step text — or it fills the structure with generic filler.
+    h = H.Harness(_harness_cfg(tmp_path), log=lambda *_: None)
+    h._goal = "Landing page for ACHILLES. Tagline: klug aber vergesslich."
+    prompt = h._work_prompt("build the hero", [{"done": False, "text": "t"}], last_verify=None)
+    assert "ORIGINAL REQUEST" in prompt
+    assert "ACHILLES" in prompt and "vergesslich" in prompt
+
+
+def test_work_prompt_omits_goal_when_unset(tmp_path):
+    h = H.Harness(_harness_cfg(tmp_path), log=lambda *_: None)
+    prompt = h._work_prompt("x", [{"done": False, "text": "t"}], last_verify=None)
+    assert "ORIGINAL REQUEST" not in prompt
+
+
 def test_work_prompt_lists_existing_files(tmp_path):
     # backlog #8: each fresh step is told which files already exist, so a later step
     # reuses a filename instead of inventing a drifted one (clean.svg vs depfree.svg).
