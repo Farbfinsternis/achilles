@@ -37,6 +37,10 @@ def main(argv=None) -> int:
                         help="Skip the Definition-of-Done phase (floor oracle only). "
                              "Useful for many tiny tasks where a per-task judge would "
                              "just add churn.")
+    parser.add_argument("--interview", "--plan", dest="interview", action="store_true",
+                        help="Planungsmodus: interview you to structure the raw prompt "
+                             "into a spec (and a Definition of Done) before planning, "
+                             "instead of the autopilot straight-to-plan flow.")
     parser.add_argument("--verify", default=None,
                         help="Override the verify command (the oracle).")
     args = parser.parse_args(argv)
@@ -56,5 +60,6 @@ def main(argv=None) -> int:
         from .repl import Repl
         return Repl(cfg).run()
 
-    ok = Harness(cfg).run(" ".join(args.goal))
+    mode = "interview" if args.interview else "autopilot"
+    ok = Harness(cfg, mode=mode).run(" ".join(args.goal))
     return 0 if ok else 1

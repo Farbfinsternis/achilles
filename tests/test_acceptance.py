@@ -10,12 +10,14 @@ import pytest
 from achilles import acceptance
 from achilles.acceptance import (
     parse_acceptance,
+    render_acceptance,
     expected_paths,
     _normalise,
     _parse_verdicts,
     _sanitize_run,
     _judge,
     _gather_context,
+    _check_contains_any,
     Criterion,
     JudgeUnavailable,
 )
@@ -102,6 +104,67 @@ def test_prose_preamble_lines_are_dropped():
     assert crit[0].kind == "exists"
 
 
+# ---- contains_any (pathless verbatim content anchor) ----------------------
+
+class _Ctx:
+    def __init__(self, ws):
+        self.ws = ws
+
+
+def test_contains_any_parses_and_round_trips():
+    # The tag must survive done.md parse (not fall through to a judge line) and a
+    # render→parse round trip, so a persisted seed criterion reloads intact.
+    crit = parse_acceptance("- [ ] contains_any: Bäckerei Sonnenschein\n")
+    assert [(c.kind, c.text) for c in crit] == [("contains_any", "Bäckerei Sonnenschein")]
+    rendered = render_acceptance("g", [Criterion("contains_any", "Öffnungszeiten")])
+    assert parse_acceptance(rendered)[-1].kind == "contains_any"
+
+
+def test_contains_any_found_verbatim(tmp_path):
+    (tmp_path / "index.html").write_text(
+        "<h1>Bäckerei Sonnenschein</h1>", encoding="utf-8")
+    ok, _ = _check_contains_any("Bäckerei Sonnenschein", _Ctx(tmp_path))
+    assert ok is True
+
+
+def test_contains_any_decodes_html_entities(tmp_path):
+    # &Ouml;ffnungszeiten renders as Öffnungszeiten — must not false-RED.
+    (tmp_path / "index.html").write_text(
+        "<th>&Ouml;ffnungszeiten</th>", encoding="utf-8")
+    ok, _ = _check_contains_any("Öffnungszeiten", _Ctx(tmp_path))
+    assert ok is True
+
+
+def test_contains_any_collapses_whitespace(tmp_path):
+    (tmp_path / "index.html").write_text(
+        "Frische\n    Brötchen  täglich", encoding="utf-8")
+    ok, _ = _check_contains_any("Frische Brötchen täglich", _Ctx(tmp_path))
+    assert ok is True
+
+
+def test_contains_any_is_case_strict(tmp_path):
+    (tmp_path / "index.html").write_text("bäckerei sonnenschein", encoding="utf-8")
+    ok, _ = _check_contains_any("Bäckerei Sonnenschein", _Ctx(tmp_path))
+    assert ok is False
+
+
+def test_contains_any_excludes_achilles_state(tmp_path):
+    # The verbatim strings live in .achilles/spec.md too — matching there would be a
+    # trivial false-GREEN. The state dir must be excluded from the search.
+    state = tmp_path / ".achilles"
+    state.mkdir()
+    (state / "spec.md").write_text('- "Bäckerei Sonnenschein"', encoding="utf-8")
+    ok, _ = _check_contains_any("Bäckerei Sonnenschein", _Ctx(tmp_path))
+    assert ok is False
+
+
+def test_contains_any_missing_reports_reason(tmp_path):
+    (tmp_path / "index.html").write_text("<h1>nothing here</h1>", encoding="utf-8")
+    ok, reason = _check_contains_any("Bäckerei Sonnenschein", _Ctx(tmp_path))
+    assert ok is False
+    assert "Bäckerei Sonnenschein" in reason
+
+
 # ---- _parse_verdicts ------------------------------------------------------
 
 def test_verdicts_various_formats():
@@ -137,11 +200,6 @@ def test_sanitize_leaves_clean_command():
 
 
 # ---- judge infrastructure error (Bug 11) ----------------------------------
-
-class _Ctx:
-    def __init__(self, ws):
-        self.ws = ws
-
 
 class _JudgeCfg:
     judge_model = ""
