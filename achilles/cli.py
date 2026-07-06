@@ -41,6 +41,11 @@ def main(argv=None) -> int:
                         help="Planungsmodus: interview you to structure the raw prompt "
                              "into a spec (and a Definition of Done) before planning, "
                              "instead of the autopilot straight-to-plan flow.")
+    parser.add_argument("--serve", action="store_true",
+                        help="Run the WebSocket server (the web-UI transport) instead "
+                             "of a single run. One Harness.run() per connection.")
+    parser.add_argument("--port", type=int, default=8765,
+                        help="Port for --serve (default: 8765).")
     parser.add_argument("--verify", default=None,
                         help="Override the verify command (the oracle).")
     args = parser.parse_args(argv)
@@ -54,6 +59,11 @@ def main(argv=None) -> int:
         cfg.use_acceptance = False
     if args.verify is not None:
         cfg.verify_command = args.verify
+
+    # WebSocket server: the web-UI transport. Drives the same engine per connection.
+    if args.serve:
+        from .ws_channel import serve
+        return serve(cfg, port=args.port)
 
     # No goal on the command line → drop into the interactive session.
     if not args.goal:

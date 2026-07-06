@@ -274,10 +274,35 @@ Autopilot ist derselbe Stream ohne den `interview.*`- und den
 
 ---
 
-## 9. Bewusst NICHT in v1
+## 9. Transport: WebSocket (entschieden)
 
-- **Transport** (stdin/stdout vs WebSocket) — separate Entscheidung, Shapes sind
-  identisch.
+Der Transport ist **WebSocket**. Ein Textframe pro Nachricht, Envelope aus §2 als
+JSON. Events (Engine → UI) und Commands (UI → Engine) laufen über dieselbe
+Verbindung; ein Command trägt `reply_to`, um ein offenes `request`-Event zu
+beantworten.
+
+**Sync-Engine ↔ async-Socket — die eine Brücke.** Der Harness bleibt synchron
+(`request()` blockiert). Der WebSocket-Server ist async. Deshalb:
+
+- Die Engine läuft in einem **Worker-Thread**; `Harness.run()` bleibt linearer,
+  blockierender Code.
+- `WebSocketChannel.emit(type, data)` legt die Nachricht auf eine **Outbound-Queue**;
+  die Sende-Task des Servers drainiert sie zum Socket.
+- `WebSocketChannel.request(type, data)` vergibt eine `id`, emittiert das Event und
+  **blockiert** dann auf einem thread-sicheren Slot, bis die Empfangs-Schleife ein
+  Command mit passendem `reply_to` einroutet — dann kehrt `request()` mit dessen
+  `data` zurück.
+
+Nur die Channel-Implementierung kennt async; der Harness sieht weiterhin nur
+`emit`/`request`. Genau dafür wurde die Engine synchron gehalten (§1, Prinzip 2).
+
+v1-Rahmen: **ein Run pro Verbindung**, keine Auth. Das Serven der statischen
+Web-UI (HTTP) ist eine getrennte Frage — der Socket-Endpunkt kann allein stehen.
+
+---
+
+## 10. Bewusst NICHT in v1
+
 - **Step-Diffs.** Falls die Web-UI Diffs pro Schritt zeigen soll, kommt später
   ein `step.diff {unified}`-Event dazu. Kein Bruch am bestehenden Protokoll.
 - **Interjektion während der Ausführung.** v1 ist **strikt**: Eingabe nur, wenn
