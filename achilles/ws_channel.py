@@ -156,8 +156,8 @@ def _start_engine(cfg, goal: str, mode: str, channel: WebSocketChannel,
 
     def run():
         try:
-            harness = Harness(cfg, log=lambda t: channel.emit("log", {"text": t}),
-                              mode=mode, channel=channel)
+            # The channel is the log sink too — Harness routes self.log through it.
+            harness = Harness(cfg, mode=mode, channel=channel)
             ok = harness.run(goal)
             channel.emit("run.finished", {"result": "success" if ok else "halted"})
         except Exception as e:                      # noqa: BLE001 — surface, don't crash the loop

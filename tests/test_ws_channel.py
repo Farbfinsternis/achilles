@@ -135,10 +135,11 @@ def test_deliver_unknown_id_is_noop():
 # ---- integration: real server + loopback socket + stubbed engine ----------
 
 class _FakeHarness:
-    """Stands in for the real engine: logs, exercises a gate, returns success."""
+    """Stands in for the real engine: logs, exercises a gate, returns success.
+    Mirrors the real Harness: self.log routes through the channel as a log event."""
     def __init__(self, cfg, log=print, mode="autopilot", channel=None):
-        self.log = log
         self.channel = channel
+        self.log = lambda text="": channel.emit("log", {"text": text})
 
     def run(self, goal):
         self.log(f"planning: {goal}")

@@ -12,10 +12,11 @@ returns it as a dict, so run() stays linear code. A terminal client answers via
 input(); a future web client answers over a WebSocket. Same engine, no
 `if terminal:` in the harness.
 
-v1 wires the NEW interactive points (the interview and the spec approval gate)
-through this seam. The existing plan-approval path still uses input() directly;
-migrating it — and typing the log stream into semantic events — is the later
-mechanical pass noted in the protocol.
+All interactive gates run over this seam — the interview, the spec approval gate,
+AND the plan approval (decision + edit instruction folded into one request/reply).
+All narration flows as `log` events too (Harness routes self.log through emit).
+What is still deferred: typing the log stream into SEMANTIC events (step.started,
+verify.result, …) instead of one catch-all `log` — the later mechanical pass.
 """
 
 import sys

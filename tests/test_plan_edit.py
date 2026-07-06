@@ -25,6 +25,51 @@ def _mk(tmp_path):
     return h
 
 
+class _ScriptedApprovalChannel:
+    """Drives _approve_loop over the REAL channel boundary (no monkeypatching of
+    _approve): each approval.request returns the next scripted reply."""
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.requests = []
+
+    def emit(self, type, data):
+        pass
+
+    def request(self, type, data):
+        self.requests.append((type, dict(data)))
+        return self.replies.pop(0)
+
+
+def test_approve_loop_edit_flows_through_channel(tmp_path, monkeypatch):
+    # The plan gate now runs over the channel: an 'edit' reply folds decision +
+    # instruction into one round trip, which _approve stashes for _ask_edit_instruction.
+    ch = _ScriptedApprovalChannel([
+        {"decision": "edit", "instruction": "make step two about CSS"},
+        {"decision": "approve"},
+    ])
+    h = H.Harness(_cfg(tmp_path), channel=ch)
+    h.state_dir.mkdir(parents=True, exist_ok=True)
+
+    def _revise(config, goal, steps, instruction, tree):
+        assert instruction == "make step two about CSS"      # carried by the reply
+        return ["step one", "step two about CSS"]
+    monkeypatch.setattr(H, "revise_plan", _revise)
+
+    plan = [{"done": False, "text": "step one"}, {"done": False, "text": "step two"}]
+    result = h._approve_loop("build", plan, "tree")
+
+    assert [s["text"] for s in result] == ["step one", "step two about CSS"]
+    assert [t for t, _ in ch.requests] == ["approval.request", "approval.request"]
+    assert ch.requests[0][1] == {"subject": "plan"}
+
+
+def test_approve_loop_reject_through_channel_returns_none(tmp_path):
+    ch = _ScriptedApprovalChannel([{"decision": "reject"}])
+    h = H.Harness(_cfg(tmp_path), channel=ch)
+    h.state_dir.mkdir(parents=True, exist_ok=True)
+    assert h._approve_loop("g", [{"done": False, "text": "x"}], "t") is None
+
+
 def test_edit_revises_via_model_and_keeps_untouched(tmp_path, monkeypatch):
     h = _mk(tmp_path)
     plan = [{"done": False, "text": "step one"},

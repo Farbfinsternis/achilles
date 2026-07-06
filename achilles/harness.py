@@ -130,17 +130,20 @@ class Harness:
     def __init__(self, config: Config, log: Callable[[str], None] = print,
                  mode: str = "autopilot", channel=None):
         self.cfg = config
-        self.log = log
         # mode: "autopilot" (plan straight from the goal) or "interview" (structure
         # the raw prompt into a Spec first). The UI's "Neues Projekt ▾" dropdown.
         self.mode = mode
         # The engine/UI boundary (docs/protocol.md). Defaults to the terminal client
-        # built around the same log callback; a web UI injects its own Channel.
+        # built around the given log callback; a web UI injects its own Channel.
         self.channel = channel or TerminalChannel(
             log, auto_approve=getattr(config, "auto_approve_plan", False))
+        # ALL narration goes through the channel as a log event — the terminal client
+        # prints it, a web client streams it. build_registry and acceptance get this
+        # same routed logger, so tool output and judging flow over the boundary too.
+        self.log = lambda text="": self.channel.emit("log", {"text": text})
         self.ws = config.workspace_path
         self.ctx = ToolContext(self.ws)
-        self.registry = build_registry(config, log)
+        self.registry = build_registry(config, self.log)
         # The act protocol: "native" | "json" | "text". Both schemas are built once;
         # only one is used per the choice. _protocol may DEGRADE to "text" mid-run if
         # the server rejects the richer request (see _act_until_done).
@@ -963,19 +966,15 @@ class Harness:
         self.log(ui.muted(f"   ⤓ archived previous spec → {dest.name}"))
 
     def _approve(self) -> str:
-        """The user's verdict on the plan: 'yes', 'no', or 'edit'. Auto-approve and
-        non-interactive runs proceed."""
-        if self.cfg.auto_approve_plan:
-            return "yes"
-        import sys
-        if not sys.stdin.isatty():
-            return "yes"  # non-interactive run: proceed
-        ans = input("\nProceed with this plan? [Y/n/edit] ").strip().lower()
-        if ans in ("", "y", "yes"):
-            return "yes"
-        if ans in ("e", "edit"):
+        """The user's verdict on the plan via the channel: 'yes', 'no', or 'edit'.
+        The terminal client applies the auto-approve / non-interactive passthrough;
+        an 'edit' reply also carries the change, which _ask_edit_instruction reads."""
+        reply = self.channel.request("approval.request", {"subject": "plan"})
+        decision = reply.get("decision", "approve")
+        if decision == "edit":
+            self._pending_edit = (reply.get("instruction") or "").strip()
             return "edit"
-        return "no"
+        return "yes" if decision == "approve" else "no"
 
     def _approve_loop(self, goal: str, plan: List[dict], tree: str):
         """Approve the plan, allowing MODEL-driven edits that keep the untouched steps.
@@ -1012,12 +1011,10 @@ class Harness:
             self._print_plan(plan)
 
     def _ask_edit_instruction(self) -> str:
-        """Ask the user, in plain words, what to change about the plan."""
-        try:
-            return input("\nDescribe the change for the model to make "
-                         "(plain words, empty to cancel): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return ""
+        """The change the user described at the plan gate. The channel's approval
+        reply folds decision + instruction into one round trip; _approve stashes it
+        here so _approve_loop's two-step structure (and its tests) stay intact."""
+        return getattr(self, "_pending_edit", "")
 
     # ---- git checkpointing --------------------------------------------
 
