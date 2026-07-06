@@ -14,9 +14,11 @@ input(); a future web client answers over a WebSocket. Same engine, no
 
 All interactive gates run over this seam — the interview, the spec approval gate,
 AND the plan approval (decision + edit instruction folded into one request/reply).
-All narration flows as `log` events too (Harness routes self.log through emit).
-What is still deferred: typing the log stream into SEMANTIC events (step.started,
-verify.result, …) instead of one catch-all `log` — the later mechanical pass.
+Narration flows as `log` events, and the meaningful state changes ALSO surface as
+typed SEMANTIC events (plan.ready, dod.ready, step.started/finished, verify.result,
+commit.made, accept.round/failures — see docs/protocol.md §3, emitted by the
+harness) plus the run.started/finished/error lifecycle (emitted by the driver).
+The TerminalChannel renders only `log`; a web client consumes the typed events.
 """
 
 import sys

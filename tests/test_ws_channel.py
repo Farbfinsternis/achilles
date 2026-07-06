@@ -189,6 +189,7 @@ def test_server_drives_engine_end_to_end(monkeypatch, tmp_path):
     events = asyncio.run(asyncio.wait_for(_drive_client(cfg), timeout=10))
 
     types = [e["type"] for e in events]
+    assert types[0] == "run.started"                    # lifecycle event, driver-emitted
     assert "approval.request" in types                  # gate reached the client
     assert types[-1] == "run.finished"
     assert events[-1]["data"]["result"] == "success"

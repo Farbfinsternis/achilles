@@ -151,11 +151,13 @@ async def _read_http_headers(reader) -> dict:
 def _start_engine(cfg, goal: str, mode: str, channel: WebSocketChannel,
                   loop, out) -> threading.Thread:
     """Run one Harness.run() in a worker thread, driven by the WebSocketChannel.
-    Emits run.finished (or error) and then signals the sender to close."""
+    Emits the run.started/run.finished/error lifecycle (the driver owns it; the
+    harness emits the domain events) and then signals the sender to close."""
     from .harness import Harness
 
     def run():
         try:
+            channel.emit("run.started", {"goal": goal, "mode": mode})
             # The channel is the log sink too — Harness routes self.log through it.
             harness = Harness(cfg, mode=mode, channel=channel)
             ok = harness.run(goal)

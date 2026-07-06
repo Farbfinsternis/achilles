@@ -155,6 +155,13 @@ class Harness:
         self.dod_path = self.state_dir / "done.md"
         self.spec_path = self.state_dir / "spec.md"
 
+    def _event(self, type: str, data: dict) -> None:
+        """Emit a SEMANTIC event alongside the human-readable log line. The terminal
+        client drops non-log events; a web client renders them (docs/protocol.md §3).
+        Domain events live here; the run.started/run.finished/error lifecycle is the
+        driver's (see ws_channel._start_engine)."""
+        self.channel.emit(type, data)
+
     # ---- public entry point -------------------------------------------
 
     def run(self, goal: str) -> bool:
@@ -205,6 +212,7 @@ class Harness:
         if plan and (all(s["done"] for s in plan) or self._stored_goal() != goal_for_plan):
             self._archive_plan()
             plan = []
+        resumed = bool(plan)                 # a surviving plan for this goal → resume
         if not plan:
             self.log("\n" + ui.head("PLAN") + "\n" + ui.muted("Goal: ") + ui.bold(goal_for_plan) + "\n")
             tree = self.registry.dispatch(ToolCall("list_dir", {"path": "."}), self.ctx)
@@ -227,6 +235,10 @@ class Harness:
             plan = self._approve_loop(goal_for_plan, plan, tree)
             if plan is None:
                 return False
+
+        self._event("plan.ready", {
+            "steps": [{"text": s["text"], "done": s["done"]} for s in plan],
+            "resumed": resumed})
 
         # STATE: EXECUTE. The executor is pinned to the ORIGINAL-language goal so it
         # writes the real names/copy, never the English translation.
@@ -331,16 +343,19 @@ class Harness:
         retries it — marking it done would burn the whole plan (every step done,
         nothing to resume) even though no work happened."""
         last_verify = None
+        total = len(plan)
         for idx, step in enumerate(plan):
             if step["done"]:
                 continue
-            self.log("\n" + ui.head(f"STEP {idx + 1}/{len(plan)}") + "\n" + ui.bold(step['text']))
+            self.log("\n" + ui.head(f"STEP {idx + 1}/{total}") + "\n" + ui.bold(step['text']))
+            self._event("step.started", {"index": idx + 1, "total": total, "text": step["text"]})
             if not self._work(self._work_prompt(step["text"], plan, last_verify)):
                 # Model error: this step did NOT run. Leave it open and stop, so
                 # a later resume picks up exactly here (Bug 1: silent plan burn).
                 self._save_plan(goal, plan)
                 self.log(ui.bad(f"\n✖  Halted at step {idx + 1}: the model was unreachable.") + "\n"
                          + ui.muted("The step is left unfinished — fix the model server and re-run to resume."))
+                self._event("step.finished", {"index": idx + 1, "status": "unfinished"})
                 return False, last_verify
             passed, last_verify = self._verify()
             step["done"] = True
@@ -350,7 +365,8 @@ class Harness:
             # ✖ when it went red. The step still counts as done either way (the
             # oracle is a signal, not a gate) — this is just the visual receipt.
             mark = ui.ok("✔") if passed else ui.bad("✖")
-            self.log(f"   {mark} " + ui.muted(f"step {idx + 1}/{len(plan)} done"))
+            self.log(f"   {mark} " + ui.muted(f"step {idx + 1}/{total} done"))
+            self._event("step.finished", {"index": idx + 1, "status": "done"})
         return True, last_verify
 
     def _ensure_floor_green(self, goal: str, plan: List[dict]):
@@ -383,6 +399,7 @@ class Harness:
         for rnd in range(1, self.cfg.max_accept_rounds + 1):
             self.log("\n" + ui.head(f"ACCEPT {rnd}/{self.cfg.max_accept_rounds}", color="magenta")
                      + " " + ui.muted("(checking the Definition of Done)"))
+            self._event("accept.round", {"round": rnd, "max": self.cfg.max_accept_rounds})
             try:
                 failures = check(self.cfg, criteria, self.registry, self.ctx, self.log)
             except JudgeUnavailable as e:
@@ -393,6 +410,9 @@ class Harness:
             if not failures:
                 self.log("\n" + ui.ok("✔  Definition of Done met — task complete."))
                 return True
+            self._event("accept.failures", {"failures": [
+                {"kind": f.criterion.kind, "text": f.criterion.text, "reason": f.reason}
+                for f in failures]})
             # Non-convergence guard: if the previous fix left the EXACT same criteria
             # unmet, another round just rewrites the same thing (a weak model
             # regenerates rather than repairs, and a byte-exact contains can be
@@ -461,6 +481,8 @@ class Harness:
         result = self.ctx.shell(self.cfg.verify_command)
         passed = result.startswith("exit=0")
         self.log("   " + (ui.ok("✔ green") if passed else ui.bad("✖ red")))
+        self._event("verify.result",
+                    {"command": self.cfg.verify_command, "passed": passed, "output": result})
         return passed, result
 
     def _work(self, user_prompt: str) -> bool:
@@ -820,6 +842,8 @@ class Harness:
         self.log("\n" + ui.bold("Definition of Done:"))
         for c in merged:
             self.log("  " + ui.accent(f"[{c.kind}]") + f" {c.text}")
+        self._event("dod.ready",
+                    {"criteria": [{"kind": c.kind, "text": c.text} for c in merged]})
 
     @staticmethod
     def _merge_dod(seed, model):
@@ -1044,6 +1068,8 @@ class Harness:
         res = self._git("commit", "-m", message)
         if res.returncode == 0:
             self.log("   " + ui.paint("⎇", "green") + " " + ui.muted(f"committed: {message}"))
+            sha = self._git("rev-parse", "--short", "HEAD").stdout.strip()
+            self._event("commit.made", {"message": message, "sha": sha or None})
             return
         self._warn_if_commit_failed(res, "commit failed — no rollback checkpoint for this step")
 
