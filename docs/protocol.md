@@ -168,21 +168,27 @@ schlaues Modell nötig, um Fragen zu erzeugen). Startkatalog, je ein Slot:
 | `ui_ux` | UI/UX (Aussehen, Bedienung)? | Design-Default / weglassen |
 
 Da ein Chatbot einlädt, frei zu tippen, kollidiert reines Slot-Filling mit dem
-Chat-Gefühl. Auflösung: die freie Antwort läuft durch einen **minimalen Router**
-mit genau drei erkannten Absichten:
+Chat-Gefühl. Auflösung: die freie Antwort läuft durch einen **rein heuristischen
+Router** mit genau zwei Absichten — **kein Modell-Call im Interview-Loop**:
 
 ```
-answer → Slot füllen, nächste Frage
 skip   → leer / „egal" / „weiß nicht" → Default, nächste Frage
-back   → „ändere X von vorhin" → betroffenen Slot erneut fragen
+answer → alles andere → Literal-Wert als Slot-Antwort, nächste Frage
 ```
 
-Alles andere (Meta-Fragen, Geplauder) wird sanft zurückgeführt („Klären wir
-gleich — erst noch: …"). Heuristik zuerst (leer = `skip`), Modell nur bei echter
-Mehrdeutigkeit. Der Determinismus bleibt dort, wo er zählt (die Slots).
+Es gibt **kein** `back`-Intent und keine Klassifikation von Meta-Fragen. Der
+Grund: die Korrektur läuft nicht über den Stream, sondern über das
+**Spec-Approval-Gate** (`approval.request {subject:"spec"}`) — der User sieht das
+fertige Spec und kann `decision:"edit"`. Ein perfekter Inline-Router ist damit
+unnötig, und der Determinismus bleibt maximal (der einzige Modell-Kontakt im
+Planungsmodus ist die `normalize()`-Runde, die das Spec zusammensetzt). Auf
+langsamer, lokaler Hardware spart das pro Interview mehrere Modell-Aufrufe.
 
-`back` braucht **kein** neues Command: die Engine deutet den freien `value`
-selbst und emittiert die betroffene `interview.question` erneut.
+Non-interaktiv (kein TTY / Headless) nehmen alle Slots ihren Default → leeres
+Interview → Autopilot-äquivalent; der CI-/Test-Pfad bleibt grün.
+
+Die Detail-Entscheidungen zu Fragenkatalog, `normalize()` und dem
+Verbatim→DoD-Mapping stehen in [spec-artifact.md](spec-artifact.md).
 
 ---
 
