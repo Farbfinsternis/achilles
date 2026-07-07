@@ -6,6 +6,7 @@ and pinned here. normalize() is exercised with a stubbed model.
 """
 
 from achilles import spec as spec_mod
+from achilles.llm import JsonReply, LLMError
 from achilles.spec import (
     Spec, SLOTS, route_answer, render_spec, parse_spec, en_goal,
     verbatim_criteria, normalize,
@@ -13,9 +14,20 @@ from achilles.spec import (
 
 
 class _Cfg:
-    act_protocol = "native"      # not "json" → normalize() takes the chat() path
+    # "native" is the DEFAULT protocol; normalize() must still reach for the
+    # constrained-JSON path (response_format is enforced independently of the act
+    # loop), only degrading to chat() when the server rejects response_format.
+    act_protocol = "native"
     temperature = 0.2
     model = "m"
+
+
+def _no_response_format(monkeypatch):
+    """Simulate a server that rejects response_format: complete_json raises, so
+    normalize() falls through to the (stubbed) free chat() path."""
+    def boom(*a, **k):
+        raise LLMError("response_format unsupported")
+    monkeypatch.setattr(spec_mod, "complete_json", boom)
 
 
 def _spec():
@@ -96,7 +108,32 @@ def test_verbatim_criteria_empty_when_none():
 
 # ---- normalize() ----------------------------------------------------------
 
-def test_normalize_parses_model_json(monkeypatch):
+def test_normalize_uses_constrained_json_on_native(monkeypatch):
+    # THE regression test: on the `native` default, normalize() must still enforce
+    # the spec shape through the constrained-JSON channel and NEVER touch free chat()
+    # — otherwise a weak model's prose reply collapses the two-layer split.
+    obj = {
+        "source_language": "de", "purpose": "A bakery page", "audience": "locals",
+        "features": ["hero", "hours"], "scope": "static", "ui_ux": "warm",
+        "verbatim": ["Bäckerei Sonnenschein"],
+    }
+    monkeypatch.setattr(spec_mod, "complete_json",
+                        lambda *a, **k: JsonReply(obj=obj, content="", finish_reason="stop"))
+    def fail_chat(*a, **k):
+        raise AssertionError("chat() must not be called when response_format works")
+    monkeypatch.setattr(spec_mod, "chat", fail_chat)
+    s = normalize(_Cfg(), {"purpose": "eine Bäckerei-Seite"}, "Baue eine Bäckerei-Seite.")
+    assert s.source_language == "de"
+    assert s.purpose == "A bakery page"
+    assert s.features == ["hero", "hours"]
+    assert s.verbatim == ["Bäckerei Sonnenschein"]
+    assert s.original_goal == "Baue eine Bäckerei-Seite."      # pinned verbatim
+
+
+def test_normalize_parses_model_json_via_chat_fallback(monkeypatch):
+    # When the server rejects response_format, normalize() degrades to free chat()
+    # and still parses a clean JSON reply.
+    _no_response_format(monkeypatch)
     payload = (
         '{"source_language":"de","purpose":"A bakery page","audience":"locals",'
         '"features":["hero","hours"],"scope":"static","ui_ux":"warm",'
@@ -112,7 +149,9 @@ def test_normalize_parses_model_json(monkeypatch):
 
 
 def test_normalize_falls_back_on_garbage(monkeypatch):
-    # Unparseable model output must NOT crash the run; degrade to raw answers.
+    # Unparseable model output (even on the chat fallback) must NOT crash the run;
+    # degrade to raw answers.
+    _no_response_format(monkeypatch)
     monkeypatch.setattr(spec_mod, "chat", lambda *a, **k: "sorry, I cannot do that")
     answers = {"purpose": "eine Bäckerei-Seite", "audience": ""}
     s = normalize(_Cfg(), answers, "Baue eine Bäckerei-Seite.")

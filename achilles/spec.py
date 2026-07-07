@@ -26,7 +26,7 @@ import re
 from dataclasses import dataclass
 
 from .acceptance import Criterion
-from .llm import chat, complete_json, wants_constrained_json, LLMError
+from .llm import chat, complete_json, LLMError
 
 
 @dataclass(frozen=True)
@@ -154,10 +154,14 @@ def _loads(text: str):
 
 
 def _spec_via_json(config, messages):
-    """Constrained path, mirroring planner._plan_via_json. Returns the object dict,
-    or None so normalize() falls back to free chat()."""
-    if not wants_constrained_json(config):
-        return None
+    """Constrained path. ALWAYS attempted, regardless of act_protocol: the spec is a
+    one-shot structured extraction, and LM Studio grammar-enforces the response_format
+    json_schema CONTENT channel independently of native tool-calling. This is the
+    difference between planner and spec on the `native` default — the planner degrades
+    to a prose parser, but a raw spec has no prose form, so a weak model's free chat()
+    reply rarely parses as JSON and the whole two-layer split silently collapses to
+    _fallback_spec. Returns the object dict, or None so normalize() falls back to free
+    chat() when the server rejects response_format."""
     try:
         jr = complete_json(config, messages, SPEC_SCHEMA, temperature=config.temperature)
     except LLMError:
@@ -219,7 +223,7 @@ def normalize(config, answers: dict, original_goal: str, note: str = "") -> Spec
 
     `note` carries a free-text correction from the spec approval gate ("edit"): the
     spec is re-normalised from the same answers with the change applied."""
-    system = SPEC_SYSTEM + (SPEC_JSON_NOTE if wants_constrained_json(config) else "")
+    system = SPEC_SYSTEM + SPEC_JSON_NOTE
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": _render_answers(answers, original_goal, note)},

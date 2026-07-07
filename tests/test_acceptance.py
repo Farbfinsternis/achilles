@@ -71,6 +71,20 @@ def test_plain_exists_unchanged():
     assert c.text == "index.html"
 
 
+def test_exists_strips_echoed_annotation():
+    # A weak model echoing the prompt's inline annotation into the path — the path
+    # is a single token, so a run of 2+ spaces marks where prose began.
+    c = _normalise("exists", "index.html                that file must exist")
+    assert c.kind == "exists"
+    assert c.text == "index.html"
+
+
+def test_exists_keeps_single_space_path():
+    # A legitimate path with ONE space (e.g. Windows "Program Files") must survive.
+    c = _normalise("exists", "My Folder/index.html")
+    assert c.text == "My Folder/index.html"
+
+
 def test_parse_tagged_lines():
     text = (
         "- [ ] exists: index.html\n"

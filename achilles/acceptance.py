@@ -73,9 +73,13 @@ ACCEPT_SYSTEM = """You define the ACCEPTANCE CRITERIA for a coding goal — the 
 reviewer uses to decide the goal is genuinely met, not just "nothing crashed".
 
 Each criterion is ONE line. Choose the most specific check type:
-  - [ ] exists: <path>                that file must exist
-  - [ ] contains: <path> :: <text>    <text> must appear VERBATIM in that file
-  - [ ] judge: <criterion>            a content/quality judgment made by eye
+  - [ ] exists: <path>
+  - [ ] contains: <path> :: <text>
+  - [ ] judge: <criterion>
+
+exists: the file at <path> must be present. contains: <text> must appear VERBATIM
+in <path>. judge: a content/quality judgment made by eye. Write the value ONLY —
+no trailing explanation after the path or criterion.
 
 CRITICAL — contains: <text> is a LITERAL substring, matched byte-for-byte. It is
 NOT a description of a property. Put a short, concrete token you are SURE will
@@ -167,11 +171,17 @@ def _normalise(kind: str, text: str) -> Criterion:
     written clean. A `::` tail only belongs to contains — reinterpret an exists
     with one as the contains it plainly means (file must exist AND hold the text),
     and strip a stray tail off absent (which has no text half). _criterion_to_call
-    keeps the same guard as a safety net for directly-constructed criteria."""
+    keeps the same guard as a safety net for directly-constructed criteria.
+
+    Also repairs a weak model echoing a prompt's inline annotation into a path-only
+    criterion ("exists: index.html    that file must exist"): a path is a single
+    token, so a run of 2+ spaces marks where the real path ended and prose began."""
     if kind == "exists" and "::" in text:
         return Criterion(kind="contains", text=text)
     if kind == "absent" and "::" in text:
         return Criterion(kind="absent", text=text.split("::", 1)[0].strip())
+    if kind in ("exists", "absent"):
+        text = re.split(r"\s{2,}", text, 1)[0].strip()
     return Criterion(kind=kind, text=text)
 
 
