@@ -26,10 +26,12 @@ import queue
 import struct
 import threading
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 from .channel import Channel
+from . import sessions
 
 # The static web UI lives next to this package; `achilles --serve` serves it over
 # HTTP on the SAME port as the WebSocket (the handler tells a GET from an Upgrade).
@@ -191,14 +193,49 @@ def _list_models(cfg) -> bytes:
     return json.dumps(payload).encode("utf-8")
 
 
-async def _serve_http(writer, method: str, path: str, cfg) -> None:
-    """Serve the static UI and the tiny /api/models endpoint over HTTP. Same port
-    as the WebSocket; only GET is handled."""
-    route = path.split("?", 1)[0]
-    if method != "GET":
-        writer.write(_http_response("405 Method Not Allowed", b"", "text/plain"))
-    elif route == "/api/models":
+def _json_ok(obj) -> bytes:
+    return _http_response("200 OK", json.dumps(obj).encode("utf-8"), _CONTENT_TYPES[".json"])
+
+
+async def _serve_http(reader, writer, method: str, path: str, headers: dict, cfg) -> None:
+    """Serve the static UI and the small JSON API over HTTP on the WebSocket port.
+      GET  /api/models              — the model dropdown catalogue (LM Studio proxy)
+      GET  /api/recents             — known projects + their session summaries
+      GET  /api/session?path=&id=   — one session's meta + replayable event stream
+      POST /api/project  {path}     — register a project into the recents index
+    Anything else is a static file from the web dir."""
+    route, _, raw_query = path.partition("?")
+    query = urllib.parse.parse_qs(raw_query)
+    q = lambda k: (query.get(k, [""])[0])
+
+    body = b""
+    if method == "POST":
+        n = int(headers.get("content-length", "0") or 0)
+        if n:
+            try:
+                body = await reader.readexactly(n)
+            except asyncio.IncompleteReadError:
+                body = b""
+
+    if route == "/api/models" and method == "GET":
         writer.write(_http_response("200 OK", _list_models(cfg), _CONTENT_TYPES[".json"]))
+    elif route == "/api/recents" and method == "GET":
+        writer.write(_json_ok(sessions.list_recents()))
+    elif route == "/api/session" and method == "GET":
+        writer.write(_json_ok(sessions.load_session(q("path"), q("id"))))
+    elif route == "/api/project" and method == "POST":
+        try:
+            payload = json.loads(body.decode("utf-8") or "{}")
+        except ValueError:
+            payload = {}
+        proj = (payload.get("path") or "").strip()
+        if proj:
+            sessions.register_project(proj, (payload.get("name") or "").strip())
+            writer.write(_json_ok({"ok": True}))
+        else:
+            writer.write(_http_response("400 Bad Request", b"path required", "text/plain"))
+    elif method != "GET":
+        writer.write(_http_response("405 Method Not Allowed", b"", "text/plain"))
     else:
         rel = "index.html" if route in ("/", "") else route.lstrip("/")
         target = (_WEB_DIR / rel).resolve()
@@ -227,7 +264,7 @@ def _run_config(base_cfg, data: dict):
 
 
 def _start_engine(cfg, goal: str, mode: str, channel: WebSocketChannel,
-                  loop, out) -> threading.Thread:
+                  loop, out, session_id: str = "", project_path: str = "") -> threading.Thread:
     """Run one Harness.run() in a worker thread, driven by the WebSocketChannel.
     Emits the run.started/run.finished/error lifecycle (the driver owns it; the
     harness emits the domain events) and then signals the sender to close."""
@@ -235,7 +272,8 @@ def _start_engine(cfg, goal: str, mode: str, channel: WebSocketChannel,
 
     def run():
         try:
-            channel.emit("run.started", {"goal": goal, "mode": mode})
+            channel.emit("run.started", {"goal": goal, "mode": mode,
+                                         "session_id": session_id, "path": project_path})
             # The channel is the log sink too — Harness routes self.log through it.
             harness = Harness(cfg, mode=mode, channel=channel)
             ok = harness.run(goal)
@@ -256,7 +294,7 @@ async def _handle(reader, writer, cfg, log) -> None:
     # A WebSocket handshake carries Upgrade: websocket; anything else is a plain
     # HTTP GET for the static UI or the /api/models endpoint.
     if headers.get("upgrade", "").lower() != "websocket":
-        await _serve_http(writer, method, path, cfg)
+        await _serve_http(reader, writer, method, path, headers, cfg)
         return
     key = headers.get("sec-websocket-key")
     if not key:
@@ -272,12 +310,17 @@ async def _handle(reader, writer, cfg, log) -> None:
     out = asyncio.Queue()
     run_id = f"run-{int(time.time() * 1000)}"
     channel = WebSocketChannel(loop, out, run_id)
+    store = None                                     # set on run.start; the sender persists through it
 
     async def sender():
         while True:
             env = await out.get()
             if env is None:                          # sentinel: run finished
                 break
+            if store is not None:                    # persist every outgoing event (single choke point)
+                store.append(env)
+                if env.get("type") == "run.finished":
+                    store.finalize(env.get("data", {}).get("result", "success"))
             writer.write(_encode_text(json.dumps(env)))
             await writer.drain()
 
@@ -299,8 +342,16 @@ async def _handle(reader, writer, cfg, log) -> None:
             data = msg.get("data", {}) or {}
             if mtype == "run.start" and engine is None:
                 run_cfg = _run_config(cfg, data)
-                engine = _start_engine(run_cfg, data.get("goal", ""),
-                                       data.get("mode", "autopilot"), channel, loop, out)
+                proj_path = str(run_cfg.workspace_path)
+                mode = data.get("mode", "autopilot")
+                # Persist the session next to its project and register it in recents,
+                # so the run's transcript survives and the left rail can list it.
+                store = sessions.SessionStore(proj_path, run_id, {
+                    "goal": data.get("goal", ""), "mode": mode, "model": run_cfg.model})
+                sessions.register_project(proj_path)
+                engine = _start_engine(run_cfg, data.get("goal", ""), mode,
+                                       channel, loop, out,
+                                       session_id=run_id, project_path=proj_path)
             elif mtype in ("answer", "approval"):
                 channel.deliver(msg.get("reply_to") or data.get("reply_to"), data)
             # cancel and other commands: not wired in v1 (see protocol §10).
