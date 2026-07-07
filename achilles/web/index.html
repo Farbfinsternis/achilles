@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Achilles</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="app">
+    <!-- LEFT: navigation -->
+    <aside id="sidebar">
+      <div class="brand">Achilles</div>
+
+      <div class="actions">
+        <button id="new-project" class="btn">＋ Neues Projekt</button>
+        <div class="split">
+          <button id="new-session" class="btn btn-primary" disabled>＋ Neue Session</button>
+          <button id="new-session-caret" class="btn btn-primary caret" disabled aria-label="Modus wählen">▾</button>
+          <div id="mode-menu" class="menu hidden">
+            <button data-mode="autopilot" class="menu-item">Autopilot</button>
+            <button data-mode="interview" class="menu-item">Planungsmodus</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="rail-label">Recent projects</div>
+      <div id="projects" class="projects"></div>
+    </aside>
+
+    <!-- RIGHT: session -->
+    <main id="session">
+      <header id="session-bar">
+        <div class="session-meta">
+          <span id="project-path" class="muted">Kein Projekt gewählt</span>
+          <span id="run-status" class="status"></span>
+        </div>
+        <span id="conn" class="conn" title="Verbindung">●</span>
+      </header>
+
+      <div id="transcript" class="transcript">
+        <div class="empty-hint">Wähle ein Projekt und starte eine Session.</div>
+      </div>
+
+      <footer id="composer">
+        <textarea id="input" rows="1" placeholder="Nachricht … (Enter senden, Shift+Enter Zeilenumbruch)" disabled></textarea>
+        <div class="composer-row">
+          <select id="model" title="Modell"></select>
+          <button id="skip" class="btn ghost hidden">überspringen</button>
+          <button id="send" class="btn btn-primary" disabled>Senden</button>
+        </div>
+      </footer>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

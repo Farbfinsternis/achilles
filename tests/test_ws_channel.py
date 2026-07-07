@@ -16,10 +16,11 @@ import time
 import pytest
 
 from achilles import harness as H
+from achilles import ws_channel as WS
 from achilles.config import Config
 from achilles.ws_channel import (
-    _accept_key, _encode_text, _read_frame, _read_http_headers,
-    _handle, WebSocketChannel,
+    _accept_key, _encode_text, _read_frame, _read_request,
+    _handle, WebSocketChannel, _run_config, _list_models,
 )
 
 
@@ -157,7 +158,7 @@ async def _drive_client(cfg):
     writer.write(b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
                  b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
     await writer.drain()
-    await _read_http_headers(reader)                    # consume the 101 response
+    await _read_request(reader)                         # consume the 101 response
 
     writer.write(_client_frame(json.dumps(
         {"type": "run.start", "data": {"goal": "build X", "mode": "autopilot"}})))
@@ -200,3 +201,67 @@ def test_server_drives_engine_end_to_end(monkeypatch, tmp_path):
     # seq numbers are strictly increasing across the whole stream
     seqs = [e["seq"] for e in events]
     assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
+
+
+# ---- per-run config: cwd + model override (protocol §4) -------------------
+
+def test_run_config_loads_cwd_and_applies_model_override(tmp_path):
+    # A project dir with its own achilles.toml; the UI selects it (cwd) and picks a
+    # model. The run must adopt BOTH: the project's workspace and the chosen model.
+    (tmp_path / "achilles.toml").write_text('model = "project-model"\n', encoding="utf-8")
+    base = Config(workspace=".", model="server-model")
+    cfg = _run_config(base, {"cwd": str(tmp_path),
+                             "config_overrides": {"model": "chosen-model"}})
+    assert str(cfg.workspace_path) == str(tmp_path.resolve())
+    assert cfg.model == "chosen-model"                   # override wins over the toml
+
+
+def test_run_config_without_override_keeps_project_model(tmp_path):
+    (tmp_path / "achilles.toml").write_text('model = "project-model"\n', encoding="utf-8")
+    cfg = _run_config(Config(workspace="."), {"cwd": str(tmp_path)})
+    assert cfg.model == "project-model"                  # no override → project toml
+
+
+def test_run_config_no_cwd_returns_base(tmp_path):
+    base = Config(workspace=str(tmp_path), model="server-model")
+    assert _run_config(base, {"goal": "x"}) is base      # nothing selected → server cfg
+
+
+# ---- /api/models proxy ----------------------------------------------------
+
+def test_list_models_proxies_catalogue(monkeypatch):
+    class _Resp:
+        def read(self): return json.dumps({"data": [{"id": "a"}, {"id": "b"}]}).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    monkeypatch.setattr(WS.urllib.request, "urlopen", lambda *a, **k: _Resp())
+    out = json.loads(_list_models(Config(model="a")))
+    assert out == {"models": ["a", "b"], "default": "a"}
+
+
+def test_list_models_empty_when_server_down(monkeypatch):
+    def boom(*a, **k): raise OSError("refused")
+    monkeypatch.setattr(WS.urllib.request, "urlopen", boom)
+    out = json.loads(_list_models(Config(model="local-model")))
+    assert out == {"models": [], "default": "local-model"}   # UI still loads
+
+
+# ---- static HTTP serving --------------------------------------------------
+
+class _FakeWriter:
+    def __init__(self): self.buf = b""
+    def write(self, b): self.buf += b
+    async def drain(self): pass
+    def close(self): pass
+
+
+def test_serve_http_serves_index():
+    w = _FakeWriter()
+    asyncio.run(WS._serve_http(w, "GET", "/", Config()))
+    assert b"200 OK" in w.buf and b"text/html" in w.buf and b"<!doctype html>" in w.buf.lower()
+
+
+def test_serve_http_blocks_traversal():
+    w = _FakeWriter()
+    asyncio.run(WS._serve_http(w, "GET", "/../config.py", Config()))
+    assert b"404 Not Found" in w.buf
