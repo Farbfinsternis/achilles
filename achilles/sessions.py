@@ -74,7 +74,9 @@ def _session_summaries(project_path: str) -> list:
             out.append(json.loads(meta_file.read_text(encoding="utf-8")))
         except (OSError, ValueError):
             continue
-    out.sort(key=lambda s: s.get("started", 0), reverse=True)
+    # Newest first, tie-broken by id: two sessions can share a millisecond, and
+    # the id (run-<ms>) is itself monotonic, so it orders sub-millisecond ties.
+    out.sort(key=lambda s: (s.get("started", 0), s.get("id", "")), reverse=True)
     return out
 
 
