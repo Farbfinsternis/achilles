@@ -19,7 +19,9 @@ honest stance as before — which is exactly why every green step is git-committ
 """
 
 import importlib.util
+import os
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +47,76 @@ def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     return f"{head}\n... [{len(text) - len(head) - len(tail)} chars trimmed] ...\n{tail}"
 
 
+_UNSET = object()
+_MKDIR_PARENTS_RE = re.compile(r"\s+(?:-p|--parents)\b")
+_bash_cache: list = []
+
+
+def _strip_workspace_prefix(command: str) -> str:
+    """A POSIX-trained model hallucinates a /workspace mount (a container-training
+    habit), but its working dir IS the project root. Rewrite /workspace/x → x and
+    bare /workspace → . so those absolute paths resolve. Deterministic and safe —
+    nothing legitimately lives at an absolute /workspace."""
+    command = re.sub(r"(?<![\w/])/workspace/", "", command)
+    command = re.sub(r"(?<![\w/])/workspace(?![\w/])", ".", command)
+    return command
+
+
+def _fix_mkdir_parents(command: str) -> str:
+    """cmd.exe already makes intermediate dirs AND reads a leading -p as a directory
+    NAME, so `mkdir -p foo` leaves a junk -p dir. Strip the flag for a simple mkdir.
+    Only used on the cmd.exe FALLBACK path (with bash, -p works, so it stays). A
+    chained command (&&, |, ;, …) is left alone so a later -p is never touched."""
+    if re.match(r"\s*mkdir\b", command, re.I) and not re.search(r"&&|\|\||;|\||&", command):
+        return _MKDIR_PARENTS_RE.sub("", command)
+    return command
+
+
+def _find_git_bash():
+    """The bash that ships with Git for Windows — preferred over WSL's bash, which
+    runs in a different filesystem namespace. Derived from git's own location (git.exe
+    lives under cmd\\, bin\\ or mingw64\\bin\\, so bash sits a variable number of levels
+    up), with a which('bash') fallback that skips the System32 WSL launcher. Cached;
+    None when nothing suitable is found, so the caller falls back to cmd.exe."""
+    if _bash_cache:
+        return _bash_cache[0]
+    found = None
+    git = shutil.which("git")
+    if git:
+        p = Path(git).resolve()
+        for base in list(p.parents)[:4]:
+            for cand in (base / "bin" / "bash.exe", base / "usr" / "bin" / "bash.exe"):
+                if cand.is_file():
+                    found = str(cand)
+                    break
+            if found:
+                break
+    if not found:
+        cand = shutil.which("bash")
+        if cand and "system32" not in cand.lower():      # not WSL's bash launcher
+            found = cand
+    _bash_cache.append(found)
+    return found
+
+
+def _resolve_command(command: str, *, windows=None, bash=_UNSET):
+    """Turn a MODEL shell command into (popen_args, use_shell), absorbing the
+    Unix-isms a POSIX-trained model emits. The /workspace hallucination is rewritten
+    to a relative path first. On Windows: route through Git-bash when available, so
+    ls/cp/pipes/redirects and `mkdir -p` just work; otherwise fall back to cmd.exe
+    with the mkdir footgun fixed. On a POSIX host the default /bin/sh already fits."""
+    if windows is None:
+        windows = os.name == "nt"
+    command = _strip_workspace_prefix(command)
+    if windows:
+        if bash is _UNSET:
+            bash = _find_git_bash()
+        if bash:
+            return ([bash, "-c", command], False)     # POSIX shell → argv, no cmd parsing
+        command = _fix_mkdir_parents(command)
+    return (command, True)
+
+
 class ToolContext:
     """What every tool is handed: the jailed workspace plus shared helpers, so a
     built-in, a manifest tool and a plugin all resolve paths and run the shell
@@ -63,13 +135,19 @@ class ToolContext:
     def truncate(self, text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
         return _truncate(text, limit)
 
-    def shell(self, command: str, timeout: int = 120) -> str:
-        """Run a shell command in the workspace. Returns exit code + combined output."""
+    def shell(self, command: str, timeout: int = 120, model: bool = False) -> str:
+        """Run a shell command in the workspace. Returns exit code + combined output.
+
+        `model=True` marks a command AUTHORED BY THE MODEL: its POSIX habits are
+        absorbed (see _resolve_command) — Git-bash on Windows, /workspace rewritten.
+        A user-authored verify_command or manifest tool runs as written on the
+        platform's default shell."""
+        popen_args, use_shell = _resolve_command(command) if model else (command, True)
         try:
             # utf-8 + replace, not the platform default: on Windows text=True
             # decodes as cp1252 and a single stray byte in a command's output
             # crashes the pipe-reader thread. Never let output encoding halt work.
-            proc = subprocess.run(command, shell=True, cwd=self.ws,
+            proc = subprocess.run(popen_args, shell=use_shell, cwd=self.ws,
                                   capture_output=True, encoding="utf-8",
                                   errors="replace", timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -159,7 +237,25 @@ def _list_dir(args, body, ctx: ToolContext) -> str:
 
 def _run_command(args, body, ctx: ToolContext) -> str:
     cmd = args.get("command") or (body or "").strip()
-    return ctx.shell(cmd)
+    return ctx.shell(cmd, model=True)
+
+
+def _copy_file(args, body, ctx: ToolContext) -> str:
+    """A portable copy so the model never reaches for `cp` (which cmd.exe lacks).
+    Path-jailed like every file tool; creates the destination's parent dirs."""
+    src = (args.get("src") or "").strip()
+    dst = (args.get("dst") or "").strip()
+    if not src or not dst:
+        return "ERROR: copy_file needs both 'src' and 'dst' paths."
+    try:
+        sp, dp = ctx.resolve(src), ctx.resolve(dst)
+    except ValueError as e:
+        return f"ERROR: {e}"
+    if not sp.is_file():
+        return f"ERROR: no such file: {src}"
+    dp.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(sp, dp)
+    return f"OK: copied {src} → {dst}"
 
 
 # Check-only tools (act=False): not shown as "hands", but the acceptance phase
@@ -212,8 +308,17 @@ BUILTINS = [
                           "content": _str("the COMPLETE new file contents; replaces "
                                           "the whole file")}, ["path", "content"]),
          body_param="content"),
+    Tool("copy_file", "copy a file from one path to another", _copy_file,
+         usage="```act\ntool: copy_file\nsrc: assets/a.jpg\ndst: assets/b.jpg\n```",
+         parameters=_obj({"src": _str("source file path, relative to the workspace"),
+                          "dst": _str("destination file path, relative to the workspace")},
+                         ["src", "dst"])),
+    # A hand AND an acceptance check: lets the model test existence without shelling
+    # out to `ls` (which cmd.exe lacks), and still backs `exists:` criteria.
+    Tool("file_exists", "check whether a file exists (exit=0 if it does)", _file_exists,
+         usage="```act\ntool: file_exists\npath: package.json\n```",
+         parameters=_obj({"path": _str("file path, relative to the workspace")}, ["path"])),
     # check-only (acceptance), hidden from the act-loop prompt:
-    Tool("file_exists", "pass if a file exists. arg: path", _file_exists, act=False),
     Tool("file_absent", "pass if a file does NOT exist. arg: path", _file_absent, act=False),
     Tool("file_contains", "pass if a file contains text. args: path, text", _file_contains, act=False),
 ]

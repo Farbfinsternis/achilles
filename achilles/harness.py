@@ -20,8 +20,10 @@ from pathlib import Path
 from typing import Callable, List
 
 from .config import Config
+from .channel import TerminalChannel
 from .llm import chat, complete_act, complete_json, ActReply, LLMError
 from .planner import make_plan, revise_plan
+from . import spec as spec_mod
 from .protocol import parse_tool_call, ToolCall
 from .tools import build_registry, ToolContext
 from . import style as ui
@@ -55,6 +57,16 @@ _SMALL_FILES_RULE = (
     "correctly in a single step."
 )
 
+# The model assumes a Linux container with a /workspace mount unless told otherwise,
+# then emits /workspace/... absolute paths and POSIX-only shell (ls, cp). Ground it:
+# its cwd IS the project root, and the portable file tools beat the shell for file ops.
+_SHELL_ENV_RULE = (
+    "\n- Your working directory IS the project root. Use RELATIVE paths like "
+    "assets/logo.png — never absolute paths such as /workspace/assets/logo.png."
+    "\n- For file operations prefer the tools (write_file, read_file, list_dir, "
+    "copy_file, file_exists) over shell commands — they behave the same on every OS."
+)
+
 EXECUTE_SYSTEM_TEMPLATE = ("""You are Achilles, a coding agent working in ONE small step of a larger plan.
 
 To use a tool, output a single fenced block tagged `act`, with `key: value`
@@ -75,7 +87,7 @@ Rules:
 - If the file you write itself contains ``` code fences (e.g. a Markdown README),
   wrap the WHOLE act block in ~~~act … ~~~ instead of ``` so the inner fences are
   not mistaken for the end of your block.
-""" + _WEB_ASSETS_RULE + _SMALL_FILES_RULE)
+""" + _WEB_ASSETS_RULE + _SMALL_FILES_RULE + _SHELL_ENV_RULE)
 
 
 # The native-tool-calling variant: the tools arrive as real functions (the OpenAI
@@ -96,7 +108,7 @@ Rules:
 - When the current step is fully implemented, STOP: reply with a short plain
   sentence and NO tool call. Do NOT claim success — the harness verifies itself.
 - Keep changes minimal and focused on the current step only.
-""" + _WEB_ASSETS_RULE + _SMALL_FILES_RULE)
+""" + _WEB_ASSETS_RULE + _SMALL_FILES_RULE + _SHELL_ENV_RULE)
 
 
 # The constrained-content-JSON variant (act_protocol="json"): the server
@@ -121,16 +133,27 @@ Rules:
 - When the current step is fully implemented, reply with {{"tool": "finish"}}. Do NOT
   claim success in prose — the harness verifies itself.
 - Keep changes minimal and focused on the current step only.
-""" + _WEB_ASSETS_RULE + _SMALL_FILES_RULE)
+""" + _WEB_ASSETS_RULE + _SMALL_FILES_RULE + _SHELL_ENV_RULE)
 
 
 class Harness:
-    def __init__(self, config: Config, log: Callable[[str], None] = print):
+    def __init__(self, config: Config, log: Callable[[str], None] = print,
+                 mode: str = "autopilot", channel=None):
         self.cfg = config
-        self.log = log
+        # mode: "autopilot" (plan straight from the goal) or "interview" (structure
+        # the raw prompt into a Spec first). The UI's "Neues Projekt ▾" dropdown.
+        self.mode = mode
+        # The engine/UI boundary (docs/protocol.md). Defaults to the terminal client
+        # built around the given log callback; a web UI injects its own Channel.
+        self.channel = channel or TerminalChannel(
+            log, auto_approve=getattr(config, "auto_approve_plan", False))
+        # ALL narration goes through the channel as a log event — the terminal client
+        # prints it, a web client streams it. build_registry and acceptance get this
+        # same routed logger, so tool output and judging flow over the boundary too.
+        self.log = lambda text="": self.channel.emit("log", {"text": text})
         self.ws = config.workspace_path
         self.ctx = ToolContext(self.ws)
-        self.registry = build_registry(config, log)
+        self.registry = build_registry(config, self.log)
         # The act protocol: "native" | "json" | "text". Both schemas are built once;
         # only one is used per the choice. _protocol may DEGRADE to "text" mid-run if
         # the server rejects the richer request (see _act_until_done).
@@ -140,6 +163,14 @@ class Harness:
         self.state_dir = self.ws / ".achilles"
         self.plan_path = self.state_dir / "plan.md"
         self.dod_path = self.state_dir / "done.md"
+        self.spec_path = self.state_dir / "spec.md"
+
+    def _event(self, type: str, data: dict) -> None:
+        """Emit a SEMANTIC event alongside the human-readable log line. The terminal
+        client drops non-log events; a web client renders them (docs/protocol.md §3).
+        Domain events live here; the run.started/run.finished/error lifecycle is the
+        driver's (see ws_channel._start_engine)."""
+        self.channel.emit(type, data)
 
     # ---- public entry point -------------------------------------------
 
@@ -165,21 +196,38 @@ class Harness:
                      "flying blind. Steps will be committed without proof. Set "
                      "verify_command in achilles.toml (e.g. \"python -m pytest -q\")."))
 
+        # STATE: SPEC (interview mode only) — structure the raw prompt into a Spec
+        # BEFORE planning. The planner and the Definition of Done then work from the
+        # English view (en_goal); the ORIGINAL-language goal is preserved verbatim as
+        # the content truth pinned into the executor, and the verbatim content strings
+        # seed the Definition of Done as deterministic contains_any anchors.
+        content_goal = goal        # what the executor sees as the content truth
+        goal_for_plan = goal       # what the planner / DoD reason over
+        seed_dod = []
+        if self.mode == "interview":
+            spec = self._prepare_spec(goal)
+            if spec is None:
+                return False       # spec generation failed, or declined at the gate
+            content_goal = spec.original_goal
+            goal_for_plan = spec_mod.en_goal(spec)
+            seed_dod = spec_mod.verbatim_criteria(spec)
+
         # STATE: PLAN — decide whether to RESUME or start FRESH.
-        # The plan is keyed to a goal (its `> Goal:` line). We resume only when a
-        # persisted plan belongs to THIS goal and still has unfinished steps. A
+        # The plan is keyed to goal_for_plan (its `> Goal:` line). We resume only when
+        # a persisted plan belongs to THIS goal and still has unfinished steps. A
         # finished plan, or one written for a different goal, gets archived so the
         # new goal is planned from scratch (otherwise a completed plan silently
         # swallows the next goal — every step `done`, nothing to do).
         plan = self._load_plan()
-        if plan and (all(s["done"] for s in plan) or self._stored_goal() != goal):
+        if plan and (all(s["done"] for s in plan) or self._stored_goal() != goal_for_plan):
             self._archive_plan()
             plan = []
+        resumed = bool(plan)                 # a surviving plan for this goal → resume
         if not plan:
-            self.log("\n" + ui.head("PLAN") + "\n" + ui.muted("Goal: ") + ui.bold(goal) + "\n")
+            self.log("\n" + ui.head("PLAN") + "\n" + ui.muted("Goal: ") + ui.bold(goal_for_plan) + "\n")
             tree = self.registry.dispatch(ToolCall("list_dir", {"path": "."}), self.ctx)
             try:
-                steps = make_plan(self.cfg, goal, tree)
+                steps = make_plan(self.cfg, goal_for_plan, tree)
             except LLMError as e:
                 self.log(ui.bad(f"✖  Planning failed: {e}"))
                 return False
@@ -187,18 +235,24 @@ class Harness:
                 self.log(ui.bad("✖  The model returned no parseable steps. Try rephrasing the goal."))
                 return False
             plan = [{"done": False, "text": s} for s in steps]
-            self._save_plan(goal, plan)
+            self._save_plan(goal_for_plan, plan)
             self._print_plan(plan)
             # Second planning pass: the Definition of Done (the ceiling). One
-            # approval covers both the steps and the acceptance contract.
+            # approval covers both the steps and the acceptance contract. The seed
+            # anchors (interview mode) are merged in ahead of the model's criteria.
             if self.cfg.use_acceptance:
-                self._make_and_save_dod(goal, tree)
-            plan = self._approve_loop(goal, plan, tree)
+                self._make_and_save_dod(goal_for_plan, tree, seed=seed_dod)
+            plan = self._approve_loop(goal_for_plan, plan, tree)
             if plan is None:
                 return False
 
-        # STATE: EXECUTE.
-        return self._execute(goal, plan)
+        self._event("plan.ready", {
+            "steps": [{"text": s["text"], "done": s["done"]} for s in plan],
+            "resumed": resumed})
+
+        # STATE: EXECUTE. The executor is pinned to the ORIGINAL-language goal so it
+        # writes the real names/copy, never the English translation.
+        return self._execute(content_goal, plan)
 
     # ---- dropped-workflow adoption (image gen only) -------------------
 
@@ -299,16 +353,19 @@ class Harness:
         retries it — marking it done would burn the whole plan (every step done,
         nothing to resume) even though no work happened."""
         last_verify = None
+        total = len(plan)
         for idx, step in enumerate(plan):
             if step["done"]:
                 continue
-            self.log("\n" + ui.head(f"STEP {idx + 1}/{len(plan)}") + "\n" + ui.bold(step['text']))
+            self.log("\n" + ui.head(f"STEP {idx + 1}/{total}") + "\n" + ui.bold(step['text']))
+            self._event("step.started", {"index": idx + 1, "total": total, "text": step["text"]})
             if not self._work(self._work_prompt(step["text"], plan, last_verify)):
                 # Model error: this step did NOT run. Leave it open and stop, so
                 # a later resume picks up exactly here (Bug 1: silent plan burn).
                 self._save_plan(goal, plan)
                 self.log(ui.bad(f"\n✖  Halted at step {idx + 1}: the model was unreachable.") + "\n"
                          + ui.muted("The step is left unfinished — fix the model server and re-run to resume."))
+                self._event("step.finished", {"index": idx + 1, "status": "unfinished"})
                 return False, last_verify
             passed, last_verify = self._verify()
             step["done"] = True
@@ -318,7 +375,8 @@ class Harness:
             # ✖ when it went red. The step still counts as done either way (the
             # oracle is a signal, not a gate) — this is just the visual receipt.
             mark = ui.ok("✔") if passed else ui.bad("✖")
-            self.log(f"   {mark} " + ui.muted(f"step {idx + 1}/{len(plan)} done"))
+            self.log(f"   {mark} " + ui.muted(f"step {idx + 1}/{total} done"))
+            self._event("step.finished", {"index": idx + 1, "status": "done"})
         return True, last_verify
 
     def _ensure_floor_green(self, goal: str, plan: List[dict]):
@@ -351,6 +409,7 @@ class Harness:
         for rnd in range(1, self.cfg.max_accept_rounds + 1):
             self.log("\n" + ui.head(f"ACCEPT {rnd}/{self.cfg.max_accept_rounds}", color="magenta")
                      + " " + ui.muted("(checking the Definition of Done)"))
+            self._event("accept.round", {"round": rnd, "max": self.cfg.max_accept_rounds})
             try:
                 failures = check(self.cfg, criteria, self.registry, self.ctx, self.log)
             except JudgeUnavailable as e:
@@ -361,6 +420,9 @@ class Harness:
             if not failures:
                 self.log("\n" + ui.ok("✔  Definition of Done met — task complete."))
                 return True
+            self._event("accept.failures", {"failures": [
+                {"kind": f.criterion.kind, "text": f.criterion.text, "reason": f.reason}
+                for f in failures]})
             # Non-convergence guard: if the previous fix left the EXACT same criteria
             # unmet, another round just rewrites the same thing (a weak model
             # regenerates rather than repairs, and a byte-exact contains can be
@@ -429,6 +491,8 @@ class Harness:
         result = self.ctx.shell(self.cfg.verify_command)
         passed = result.startswith("exit=0")
         self.log("   " + (ui.ok("✔ green") if passed else ui.bad("✖ red")))
+        self._event("verify.result",
+                    {"command": self.cfg.verify_command, "passed": passed, "output": result})
         return passed, result
 
     def _work(self, user_prompt: str) -> bool:
@@ -461,10 +525,12 @@ class Harness:
         json both drop the fence usage examples (the schema/grammar carries the arg
         shape); only the text protocol shows the ```act``` syntax."""
         if self._protocol == "text":
-            return EXECUTE_SYSTEM_TEMPLATE.format(
+            base = EXECUTE_SYSTEM_TEMPLATE.format(
                 tools=self.registry.describe(include_usage=True))
-        template = JSON_SYSTEM_TEMPLATE if self._protocol == "json" else NATIVE_SYSTEM_TEMPLATE
-        return template.format(tools=self.registry.describe(include_usage=False))
+        else:
+            template = JSON_SYSTEM_TEMPLATE if self._protocol == "json" else NATIVE_SYSTEM_TEMPLATE
+            base = template.format(tools=self.registry.describe(include_usage=False))
+        return base
 
     def _act_until_done(self, messages: List[dict]) -> bool:
         """Inner loop: let the model take actions until it stops acting.
@@ -763,21 +829,62 @@ class Harness:
 
     # ---- Definition of Done (the ceiling) -----------------------------
 
-    def _make_and_save_dod(self, goal: str, tree: str) -> None:
+    def _make_and_save_dod(self, goal: str, tree: str, seed=()) -> None:
         from .acceptance import make_acceptance, render_acceptance
+        seed = list(seed)
         try:
             criteria = make_acceptance(self.cfg, goal, tree)
         except LLMError as e:
-            self.log(ui.warn(f"⚠  Could not generate a Definition of Done ({e}); "
-                     "proceeding with the verification oracle alone."))
-            return
-        if not criteria:
+            # A failed model DoD is not fatal when we still have deterministic seed
+            # anchors (interview mode) — write those alone rather than losing them.
+            criteria = []
+            if not seed:
+                self.log(ui.warn(f"⚠  Could not generate a Definition of Done ({e}); "
+                         "proceeding with the verification oracle alone."))
+                return
+            self.log(ui.warn(f"⚠  Could not generate the model Definition of Done ({e}); "
+                     "proceeding with the seed content anchors alone."))
+        merged = self._merge_dod(seed, criteria)
+        if not merged:
             self.log(ui.warn("⚠  No Definition of Done produced; proceeding with the oracle alone."))
             return
-        self.dod_path.write_text(render_acceptance(goal, criteria), encoding="utf-8")
+        self.dod_path.write_text(render_acceptance(goal, merged), encoding="utf-8")
         self.log("\n" + ui.bold("Definition of Done:"))
-        for c in criteria:
+        for c in merged:
             self.log("  " + ui.accent(f"[{c.kind}]") + f" {c.text}")
+        self._event("dod.ready",
+                    {"criteria": [{"kind": c.kind, "text": c.text} for c in merged]})
+
+    @staticmethod
+    def _merge_dod(seed, model):
+        """Seed criteria first (the deterministic contains_any content anchors), then
+        the model's. Dedup by (kind, normalised text). Collision rule: a model
+        contains/contains_any that names a string ALREADY seeded as contains_any is
+        dropped — the robust pathless anchor wins over the model's brittle path-bound
+        duplicate (which would reintroduce the language/path false-RED it avoids)."""
+        from .acceptance import _norm_content
+        seeded = {_norm_content(c.text) for c in seed if c.kind == "contains_any"}
+        out, seen = [], set()
+
+        def key(c):
+            text = _norm_content(c.text) if c.kind == "contains_any" else c.text.strip()
+            return (c.kind, text)
+
+        def add(c):
+            k = key(c)
+            if k not in seen:
+                seen.add(k)
+                out.append(c)
+
+        for c in seed:
+            add(c)
+        for c in model:
+            if c.kind in ("contains", "contains_any"):
+                content = c.text.split("::", 1)[1] if "::" in c.text else c.text
+                if _norm_content(content) in seeded:
+                    continue
+            add(c)
+        return out
 
     def _load_dod(self):
         from .acceptance import parse_acceptance
@@ -785,20 +892,123 @@ class Harness:
             return []
         return parse_acceptance(self.dod_path.read_text(encoding="utf-8"))
 
+    # ---- SPEC (interview mode): structure the raw prompt ---------------
+
+    def _prepare_spec(self, goal: str):
+        """Interview → normalize → spec gate. Returns the approved Spec, or None if
+        generation failed or the user declined. On resume (a saved spec.md for THIS
+        goal) the interview and the gate are skipped — the spec is already approved."""
+        spec = self._load_spec()
+        if spec and spec.original_goal.strip() == goal.strip():
+            self.log("\n" + ui.muted("   resuming from the saved spec (.achilles/spec.md)"))
+            return spec
+        if spec:
+            self._archive_spec()                 # a different goal → start clean
+
+        self.log("\n" + ui.head("INTERVIEW") + "\n"
+                 + ui.muted("A few questions to structure the project. Press Enter to skip a question.\n"))
+        answers = self._interview(spec_mod.SLOTS)
+        self.log("\n" + ui.muted("   structuring your answers into a spec …"))
+        try:
+            spec = spec_mod.normalize(self.cfg, answers, goal)
+        except LLMError as e:
+            self.log(ui.bad(f"✖  Could not generate the spec: {e}"))
+            return None
+        self._save_spec(spec)
+        self._print_spec(spec)
+        return self._spec_approve_loop(answers, spec)
+
+    def _interview(self, slots) -> dict:
+        """Stream the fixed catalogue through the channel, one slot at a time. Each
+        answer runs through the 2-intent router (skip/answer); a skip leaves the slot
+        empty so normalize() fills it from the default or the goal."""
+        answers: dict = {}
+        for slot in slots:
+            reply = self.channel.request("interview.question", {
+                "field": slot.field, "prompt": slot.prompt,
+                "default": slot.default, "kind": "text",
+            })
+            raw = "" if reply.get("skip") else reply.get("value", "")
+            intent, value = spec_mod.route_answer(raw)
+            answers[slot.field] = value if intent == "answer" else ""
+        return answers
+
+    def _spec_approve_loop(self, answers: dict, spec):
+        """Approve the spec, allowing model-driven edits from a plain-words change.
+        'edit' re-normalises the same answers with the correction applied. Returns the
+        Spec to plan from, or None if declined."""
+        while True:
+            reply = self.channel.request("approval.request", {
+                "subject": "spec", "content": spec_mod.render_spec(spec)})
+            decision = reply.get("decision", "approve")
+            if decision == "approve":
+                return spec
+            if decision == "reject":
+                self.log("Stopped. Re-run the same goal to resume from the saved spec.")
+                return None
+            instruction = (reply.get("instruction") or "").strip()
+            if not instruction:
+                continue                         # empty → nothing to change, re-ask
+            self.log(ui.muted("   applying your change to the spec …"))
+            try:
+                spec = spec_mod.normalize(self.cfg, answers, spec.original_goal,
+                                          note=instruction)
+            except LLMError as e:
+                self.log(ui.bad(f"✖  Could not revise the spec: {e}"))
+                continue                         # keep the current spec, re-ask
+            self._save_spec(spec)
+            self.log("")
+            self._print_spec(spec)
+
+    def _print_spec(self, spec) -> None:
+        self.log("\n" + ui.bold("Spec:"))
+        self.log("  " + ui.accent("Purpose:  ") + spec.purpose)
+        self.log("  " + ui.accent("Audience: ") + spec.audience)
+        if spec.features:
+            self.log("  " + ui.accent("Features:"))
+            for f in spec.features:
+                self.log("    - " + f)
+        self.log("  " + ui.accent("Scope:    ") + spec.scope)
+        if spec.ui_ux:
+            self.log("  " + ui.accent("UI/UX:    ") + spec.ui_ux)
+        if spec.verbatim:
+            self.log("  " + ui.accent("Verbatim content (must appear literally):"))
+            for v in spec.verbatim:
+                self.log("    - " + ui.bold(v))
+
+    def _load_spec(self):
+        if not self.spec_path.is_file():
+            return None
+        try:
+            return spec_mod.parse_spec(self.spec_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _save_spec(self, spec) -> None:
+        self.spec_path.write_text(spec_mod.render_spec(spec), encoding="utf-8")
+
+    def _archive_spec(self) -> None:
+        """Move a stale spec aside (spec.<n>.md) so a new goal starts clean while the
+        old one stays for reference — the same scheme as _archive_plan."""
+        if not self.spec_path.is_file():
+            return
+        n = 1
+        while (self.state_dir / f"spec.{n}.md").exists():
+            n += 1
+        dest = self.state_dir / f"spec.{n}.md"
+        self.spec_path.rename(dest)
+        self.log(ui.muted(f"   ⤓ archived previous spec → {dest.name}"))
+
     def _approve(self) -> str:
-        """The user's verdict on the plan: 'yes', 'no', or 'edit'. Auto-approve and
-        non-interactive runs proceed."""
-        if self.cfg.auto_approve_plan:
-            return "yes"
-        import sys
-        if not sys.stdin.isatty():
-            return "yes"  # non-interactive run: proceed
-        ans = input("\nProceed with this plan? [Y/n/edit] ").strip().lower()
-        if ans in ("", "y", "yes"):
-            return "yes"
-        if ans in ("e", "edit"):
+        """The user's verdict on the plan via the channel: 'yes', 'no', or 'edit'.
+        The terminal client applies the auto-approve / non-interactive passthrough;
+        an 'edit' reply also carries the change, which _ask_edit_instruction reads."""
+        reply = self.channel.request("approval.request", {"subject": "plan"})
+        decision = reply.get("decision", "approve")
+        if decision == "edit":
+            self._pending_edit = (reply.get("instruction") or "").strip()
             return "edit"
-        return "no"
+        return "yes" if decision == "approve" else "no"
 
     def _approve_loop(self, goal: str, plan: List[dict], tree: str):
         """Approve the plan, allowing MODEL-driven edits that keep the untouched steps.
@@ -835,12 +1045,10 @@ class Harness:
             self._print_plan(plan)
 
     def _ask_edit_instruction(self) -> str:
-        """Ask the user, in plain words, what to change about the plan."""
-        try:
-            return input("\nDescribe the change for the model to make "
-                         "(plain words, empty to cancel): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return ""
+        """The change the user described at the plan gate. The channel's approval
+        reply folds decision + instruction into one round trip; _approve stashes it
+        here so _approve_loop's two-step structure (and its tests) stay intact."""
+        return getattr(self, "_pending_edit", "")
 
     # ---- git checkpointing --------------------------------------------
 
@@ -870,6 +1078,8 @@ class Harness:
         res = self._git("commit", "-m", message)
         if res.returncode == 0:
             self.log("   " + ui.paint("⎇", "green") + " " + ui.muted(f"committed: {message}"))
+            sha = self._git("rev-parse", "--short", "HEAD").stdout.strip()
+            self._event("commit.made", {"message": message, "sha": sha or None})
             return
         self._warn_if_commit_failed(res, "commit failed — no rollback checkpoint for this step")
 

@@ -37,6 +37,7 @@ the artifact, not its pride. (Honest limit: isolation removes authorship BIAS;
 it cannot grant a discernment the model lacks — that ceiling is what we probe.)
 """
 
+import html
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,9 +73,13 @@ ACCEPT_SYSTEM = """You define the ACCEPTANCE CRITERIA for a coding goal — the 
 reviewer uses to decide the goal is genuinely met, not just "nothing crashed".
 
 Each criterion is ONE line. Choose the most specific check type:
-  - [ ] exists: <path>                that file must exist
-  - [ ] contains: <path> :: <text>    <text> must appear VERBATIM in that file
-  - [ ] judge: <criterion>            a content/quality judgment made by eye
+  - [ ] exists: <path>
+  - [ ] contains: <path> :: <text>
+  - [ ] judge: <criterion>
+
+exists: the file at <path> must be present. contains: <text> must appear VERBATIM
+in <path>. judge: a content/quality judgment made by eye. Write the value ONLY —
+no trailing explanation after the path or criterion.
 
 CRITICAL — contains: <text> is a LITERAL substring, matched byte-for-byte. It is
 NOT a description of a property. Put a short, concrete token you are SURE will
@@ -147,8 +152,12 @@ ACCEPT_JSON_NOTE = ('\n\nReturn ONLY a JSON object of the form {"criteria": '
                     "line in the format described above (keep the leading kind tag).")
 
 
+# `contains_any` MUST precede `contains` in the alternation so the longer tag wins.
+# (The trailing \b also blocks `contains` from matching "contains_any" — "_" is a
+# word char, so there is no boundary after "contains" there — but ordering keeps the
+# intent obvious.)
 _TAGGED = re.compile(
-    r"^\s*[-*]\s*(?:\[[ xX]?\]\s*)?(exists|absent|contains|run|cmd|check|judge)\b\s*:?\s*(.+?)\s*$",
+    r"^\s*[-*]\s*(?:\[[ xX]?\]\s*)?(exists|absent|contains_any|contains|run|cmd|check|judge)\b\s*:?\s*(.+?)\s*$",
     re.I)
 _BULLET = re.compile(r"^\s*[-*]\s*(?:\[[ xX]?\]\s*)?(.+?)\s*$")
 # A leading bullet + optional checkbox, stripped from a constrained `criteria`
@@ -162,11 +171,17 @@ def _normalise(kind: str, text: str) -> Criterion:
     written clean. A `::` tail only belongs to contains — reinterpret an exists
     with one as the contains it plainly means (file must exist AND hold the text),
     and strip a stray tail off absent (which has no text half). _criterion_to_call
-    keeps the same guard as a safety net for directly-constructed criteria."""
+    keeps the same guard as a safety net for directly-constructed criteria.
+
+    Also repairs a weak model echoing a prompt's inline annotation into a path-only
+    criterion ("exists: index.html    that file must exist"): a path is a single
+    token, so a run of 2+ spaces marks where the real path ended and prose began."""
     if kind == "exists" and "::" in text:
         return Criterion(kind="contains", text=text)
     if kind == "absent" and "::" in text:
         return Criterion(kind="absent", text=text.split("::", 1)[0].strip())
+    if kind in ("exists", "absent"):
+        text = re.split(r"\s{2,}", text, 1)[0].strip()
     return Criterion(kind=kind, text=text)
 
 
@@ -346,7 +361,44 @@ def _parse_check(text: str) -> ToolCall | None:
     return ToolCall(parts[0], args, body)
 
 
+# contains_any: a PATHLESS content anchor — the text must appear VERBATIM in SOME
+# project file, not a named one. Spec-mode emits these from the Verbatim block, where
+# the file structure isn't known yet (the planner runs later), so binding a path would
+# be an over-constraint. Both sides are normalised before matching: HTML entities are
+# decoded (&Ouml; → Ö, so entity-encoded umlauts don't false-RED) and whitespace runs
+# collapse to one space (harmless markup line-wraps tolerated). Casing stays strict —
+# the exact spelling of a name/headline is part of the requirement. An inline tag
+# SPLITTING the phrase ("Frische <em>Brötchen</em> täglich") still misses; that residue
+# is left to judge:, keeping this rule predictable.
+def _norm_content(s: str) -> str:
+    return re.sub(r"\s+", " ", html.unescape(s or "")).strip()
+
+
+def _check_contains_any(needle: str, ctx) -> tuple[bool, str]:
+    target = _norm_content(needle)
+    if not target:
+        return False, "empty contains_any criterion"
+    root: Path = ctx.ws
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root)
+        if any(part in _SKIP_DIRS for part in rel.parts):   # .achilles/ excluded here
+            continue
+        if path.suffix.lower() not in _TEXT_SUFFIXES:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        if target in _norm_content(text):
+            return True, ""
+    return False, f"text not found verbatim in any project file: {needle!r}"
+
+
 def _check_mechanical(c: Criterion, registry, ctx) -> tuple[bool, str]:
+    if c.kind == "contains_any":
+        return _check_contains_any(c.text, ctx)
     call = _criterion_to_call(c)
     if call is None:
         return False, f"malformed {c.kind} criterion: {c.text}"
