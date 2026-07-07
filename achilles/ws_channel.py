@@ -26,8 +26,21 @@ import queue
 import struct
 import threading
 import time
+import urllib.request
+from pathlib import Path
 
 from .channel import Channel
+
+# The static web UI lives next to this package; `achilles --serve` serves it over
+# HTTP on the SAME port as the WebSocket (the handler tells a GET from an Upgrade).
+_WEB_DIR = Path(__file__).resolve().parent / "web"
+_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+}
 
 # RFC 6455: the server appends this GUID to the client's key, SHA-1s it, and
 # base64s the digest into Sec-WebSocket-Accept.
@@ -135,8 +148,13 @@ class WebSocketChannel(Channel):
 
 # ---- server ---------------------------------------------------------------
 
-async def _read_http_headers(reader) -> dict:
-    await reader.readline()              # request line: GET /… HTTP/1.1
+async def _read_request(reader) -> tuple:
+    """Read the request line + headers → (method, path, headers). The method/path
+    let one handler route an HTTP GET (static UI / api) apart from a WS Upgrade."""
+    request_line = await reader.readline()             # e.g. b"GET /app.js HTTP/1.1"
+    parts = request_line.decode("latin1").split()
+    method = parts[0] if parts else ""
+    path = parts[1] if len(parts) > 1 else "/"
     headers = {}
     while True:
         line = await reader.readline()
@@ -145,7 +163,67 @@ async def _read_http_headers(reader) -> dict:
         key, _, val = line.decode("latin1").partition(":")
         if val:
             headers[key.strip().lower()] = val.strip()
-    return headers
+    return method, path, headers
+
+
+def _http_response(status: str, body: bytes, content_type: str) -> bytes:
+    head = (f"HTTP/1.1 {status}\r\n"
+            f"Content-Type: {content_type}\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "Cache-Control: no-cache\r\n\r\n")
+    return head.encode("latin1") + body
+
+
+def _list_models(cfg) -> bytes:
+    """Proxy the model server's catalogue so the UI's model dropdown is populated
+    from LM Studio (/v1/models) without a cross-origin fetch. Best-effort: an
+    unreachable server yields an empty list rather than an error, so the UI still
+    loads (the user can type/leave the config default)."""
+    ids = []
+    try:
+        with urllib.request.urlopen(cfg.base_url.rstrip("/") + "/models", timeout=5) as r:
+            body = json.loads(r.read().decode("utf-8"))
+        ids = [m.get("id") for m in body.get("data", []) if m.get("id")]
+    except Exception:                                  # noqa: BLE001 — offline model server is fine
+        ids = []
+    payload = {"models": ids, "default": cfg.model}
+    return json.dumps(payload).encode("utf-8")
+
+
+async def _serve_http(writer, method: str, path: str, cfg) -> None:
+    """Serve the static UI and the tiny /api/models endpoint over HTTP. Same port
+    as the WebSocket; only GET is handled."""
+    route = path.split("?", 1)[0]
+    if method != "GET":
+        writer.write(_http_response("405 Method Not Allowed", b"", "text/plain"))
+    elif route == "/api/models":
+        writer.write(_http_response("200 OK", _list_models(cfg), _CONTENT_TYPES[".json"]))
+    else:
+        rel = "index.html" if route in ("/", "") else route.lstrip("/")
+        target = (_WEB_DIR / rel).resolve()
+        # Path-traversal guard: never serve outside the web dir.
+        if _WEB_DIR in target.parents and target.is_file():
+            ctype = _CONTENT_TYPES.get(target.suffix, "application/octet-stream")
+            writer.write(_http_response("200 OK", target.read_bytes(), ctype))
+        else:
+            writer.write(_http_response("404 Not Found", b"not found", "text/plain"))
+    await writer.drain()
+    writer.close()
+
+
+def _run_config(base_cfg, data: dict):
+    """The per-run config for a run.start: load the SELECTED project's config (its
+    cwd/achilles.toml), then apply UI overrides (model). Falls back to the server's
+    own config when no cwd is given (protocol §4: run.start {…, cwd, config_overrides})."""
+    from .config import load_config
+    cwd = (data.get("cwd") or "").strip()
+    cfg = load_config(cwd) if cwd else base_cfg
+    overrides = data.get("config_overrides") or {}
+    model = (overrides.get("model") or "").strip()
+    if model:
+        cfg.model = model
+    return cfg
 
 
 def _start_engine(cfg, goal: str, mode: str, channel: WebSocketChannel,
@@ -174,7 +252,12 @@ def _start_engine(cfg, goal: str, mode: str, channel: WebSocketChannel,
 
 
 async def _handle(reader, writer, cfg, log) -> None:
-    headers = await _read_http_headers(reader)
+    method, path, headers = await _read_request(reader)
+    # A WebSocket handshake carries Upgrade: websocket; anything else is a plain
+    # HTTP GET for the static UI or the /api/models endpoint.
+    if headers.get("upgrade", "").lower() != "websocket":
+        await _serve_http(writer, method, path, cfg)
+        return
     key = headers.get("sec-websocket-key")
     if not key:
         writer.close()
@@ -215,7 +298,8 @@ async def _handle(reader, writer, cfg, log) -> None:
             mtype = msg.get("type")
             data = msg.get("data", {}) or {}
             if mtype == "run.start" and engine is None:
-                engine = _start_engine(cfg, data.get("goal", ""),
+                run_cfg = _run_config(cfg, data)
+                engine = _start_engine(run_cfg, data.get("goal", ""),
                                        data.get("mode", "autopilot"), channel, loop, out)
             elif mtype in ("answer", "approval"):
                 channel.deliver(msg.get("reply_to") or data.get("reply_to"), data)
@@ -237,7 +321,7 @@ def serve(cfg, host: str = "127.0.0.1", port: int = 8765, log=print) -> int:
     async def main():
         server = await asyncio.start_server(
             lambda r, w: _handle(r, w, cfg, log), host, port)
-        log(f"Achilles WebSocket server on ws://{host}:{port}  (Ctrl-C to stop)")
+        log(f"Achilles web UI on http://{host}:{port}  ·  WebSocket ws://{host}:{port}  (Ctrl-C to stop)")
         async with server:
             await server.serve_forever()
 

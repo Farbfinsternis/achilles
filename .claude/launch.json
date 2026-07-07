@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "achilles-web",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "achilles", "--serve", "--port", "8802"],
+      "port": 8802
+    }
+  ]
+}
