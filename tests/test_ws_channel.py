@@ -12,6 +12,7 @@ import json
 import struct
 import threading
 import time
+import urllib.parse
 
 import pytest
 
@@ -185,6 +186,9 @@ async def _drive_client(cfg):
 
 def test_server_drives_engine_end_to_end(monkeypatch, tmp_path):
     monkeypatch.setattr(H, "Harness", _FakeHarness)
+    # Isolate the global project index so the run's persistence never touches the
+    # real ~/.achilles (run.start registers the workspace + writes a session record).
+    monkeypatch.setattr(WS.sessions, "_home_index", lambda: tmp_path / "home" / "projects.json")
     cfg = Config(workspace=str(tmp_path), use_git=False, verify_command="")
 
     events = asyncio.run(asyncio.wait_for(_drive_client(cfg), timeout=10))
@@ -257,11 +261,61 @@ class _FakeWriter:
 
 def test_serve_http_serves_index():
     w = _FakeWriter()
-    asyncio.run(WS._serve_http(w, "GET", "/", Config()))
+    asyncio.run(WS._serve_http(None, w, "GET", "/", {}, Config()))
     assert b"200 OK" in w.buf and b"text/html" in w.buf and b"<!doctype html>" in w.buf.lower()
 
 
 def test_serve_http_blocks_traversal():
     w = _FakeWriter()
-    asyncio.run(WS._serve_http(w, "GET", "/../config.py", Config()))
+    asyncio.run(WS._serve_http(None, w, "GET", "/../config.py", {}, Config()))
     assert b"404 Not Found" in w.buf
+
+
+class _FakeReader:
+    def __init__(self, data=b""): self._d = data
+    async def readexactly(self, n): return self._d[:n]
+
+
+def _http_body(buf):
+    return json.loads(buf.split(b"\r\n\r\n", 1)[1].decode("utf-8"))
+
+
+def test_serve_http_project_register_then_recents(tmp_path, monkeypatch):
+    # POST /api/project registers a project; GET /api/recents lists it back.
+    monkeypatch.setattr(WS.sessions, "_home_index", lambda: tmp_path / "home" / "projects.json")
+    proj = tmp_path / "p"; proj.mkdir()
+    body = json.dumps({"path": str(proj), "name": "P"}).encode()
+
+    w = _FakeWriter()
+    asyncio.run(WS._serve_http(_FakeReader(body), w, "POST", "/api/project",
+                               {"content-length": str(len(body))}, Config()))
+    assert b"200 OK" in w.buf and _http_body(w.buf) == {"ok": True}
+
+    w2 = _FakeWriter()
+    asyncio.run(WS._serve_http(None, w2, "GET", "/api/recents", {}, Config()))
+    projects = _http_body(w2.buf)["projects"]
+    assert any(pr["name"] == "P" for pr in projects)
+
+
+def test_serve_http_project_requires_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(WS.sessions, "_home_index", lambda: tmp_path / "home" / "projects.json")
+    body = b"{}"
+    w = _FakeWriter()
+    asyncio.run(WS._serve_http(_FakeReader(body), w, "POST", "/api/project",
+                               {"content-length": str(len(body))}, Config()))
+    assert b"400 Bad Request" in w.buf
+
+
+def test_serve_http_session_replay(tmp_path):
+    # GET /api/session?path=&id= returns a persisted session's meta + events.
+    proj = tmp_path / "proj"; proj.mkdir()
+    st = WS.sessions.SessionStore(str(proj), "run-9", {"goal": "g", "mode": "autopilot"})
+    st.append({"type": "plan.ready", "data": {"steps": [{"text": "s"}]}})
+    st.finalize("success")
+
+    q = urllib.parse.urlencode({"path": str(proj), "id": "run-9"})
+    w = _FakeWriter()
+    asyncio.run(WS._serve_http(None, w, "GET", "/api/session?" + q, {}, Config()))
+    out = _http_body(w.buf)
+    assert out["meta"]["id"] == "run-9" and out["meta"]["result"] == "success"
+    assert [e["type"] for e in out["events"]] == ["plan.ready"]
