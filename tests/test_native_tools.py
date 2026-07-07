@@ -29,8 +29,9 @@ def _reg() -> Registry:
 def test_tool_schemas_expose_act_tools_only():
     schemas = _reg().tool_schemas()
     names = {s["function"]["name"] for s in schemas}
-    assert {"read_file", "write_file", "list_dir", "run_command"} <= names
-    assert "file_exists" not in names          # check-only tools are hidden
+    assert {"read_file", "write_file", "list_dir", "run_command",
+            "copy_file", "file_exists"} <= names
+    assert "file_absent" not in names          # check-only tools are hidden
     for s in schemas:
         assert s["type"] == "function"
         assert s["function"]["parameters"]["type"] == "object"

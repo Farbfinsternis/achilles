@@ -34,9 +34,10 @@ def test_content_json_schema_enum_and_fields():
     assert schema["additionalProperties"] is False
     props = schema["properties"]
     enum = props["tool"]["enum"]
-    assert {"read_file", "write_file", "list_dir", "run_command"} <= set(enum)
+    assert {"read_file", "write_file", "list_dir", "run_command",
+            "copy_file", "file_exists"} <= set(enum)
     assert "finish" in enum                     # the 'step done' sentinel
-    assert "file_exists" not in enum            # check-only tools stay hidden
+    assert "file_absent" not in enum            # check-only tools stay hidden
     # write_file's arguments surface as optional string fields.
     assert "path" in props and "content" in props
     assert props["content"]["type"] == "string"

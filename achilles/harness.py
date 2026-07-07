@@ -57,6 +57,16 @@ _SMALL_FILES_RULE = (
     "correctly in a single step."
 )
 
+# The model assumes a Linux container with a /workspace mount unless told otherwise,
+# then emits /workspace/... absolute paths and POSIX-only shell (ls, cp). Ground it:
+# its cwd IS the project root, and the portable file tools beat the shell for file ops.
+_SHELL_ENV_RULE = (
+    "\n- Your working directory IS the project root. Use RELATIVE paths like "
+    "assets/logo.png — never absolute paths such as /workspace/assets/logo.png."
+    "\n- For file operations prefer the tools (write_file, read_file, list_dir, "
+    "copy_file, file_exists) over shell commands — they behave the same on every OS."
+)
+
 EXECUTE_SYSTEM_TEMPLATE = ("""You are Achilles, a coding agent working in ONE small step of a larger plan.
 
 To use a tool, output a single fenced block tagged `act`, with `key: value`
@@ -77,7 +87,7 @@ Rules:
 - If the file you write itself contains ``` code fences (e.g. a Markdown README),
   wrap the WHOLE act block in ~~~act … ~~~ instead of ``` so the inner fences are
   not mistaken for the end of your block.
-""" + _WEB_ASSETS_RULE + _SMALL_FILES_RULE)
+""" + _WEB_ASSETS_RULE + _SMALL_FILES_RULE + _SHELL_ENV_RULE)
 
 
 # The native-tool-calling variant: the tools arrive as real functions (the OpenAI
@@ -98,7 +108,7 @@ Rules:
 - When the current step is fully implemented, STOP: reply with a short plain
   sentence and NO tool call. Do NOT claim success — the harness verifies itself.
 - Keep changes minimal and focused on the current step only.
-""" + _WEB_ASSETS_RULE + _SMALL_FILES_RULE)
+""" + _WEB_ASSETS_RULE + _SMALL_FILES_RULE + _SHELL_ENV_RULE)
 
 
 # The constrained-content-JSON variant (act_protocol="json"): the server
@@ -123,7 +133,7 @@ Rules:
 - When the current step is fully implemented, reply with {{"tool": "finish"}}. Do NOT
   claim success in prose — the harness verifies itself.
 - Keep changes minimal and focused on the current step only.
-""" + _WEB_ASSETS_RULE + _SMALL_FILES_RULE)
+""" + _WEB_ASSETS_RULE + _SMALL_FILES_RULE + _SHELL_ENV_RULE)
 
 
 class Harness:
